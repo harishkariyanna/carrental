@@ -1,0 +1,35 @@
+from enum import StrEnum
+
+
+class Role(StrEnum):
+    CUSTOMER = "CUSTOMER"
+    ADMIN = "ADMIN"
+    DRIVER = "DRIVER"
+
+
+class BookingStatus(StrEnum):
+    CONFIRMED = "CONFIRMED"
+    DRIVER_ASSIGNED = "DRIVER_ASSIGNED"
+    DRIVER_ACCEPTED = "DRIVER_ACCEPTED"
+    DRIVER_ON_THE_WAY = "DRIVER_ON_THE_WAY"
+    DRIVER_ARRIVED = "DRIVER_ARRIVED"
+    TRIP_STARTED = "TRIP_STARTED"
+    TRIP_COMPLETED = "TRIP_COMPLETED"
+
+
+class OtpPurpose(StrEnum):
+    START = "START"
+    DRIVER_END = "DRIVER_END"
+
+
+class ExtraChargeType(StrEnum):
+    TOLL = "TOLL"
+    PARKING = "PARKING"
+    OTHER = "OTHER"
+
+
+class MediaEntityType(StrEnum):
+    VEHICLE = "VEHICLE"
+    DRIVER = "DRIVER"
+    CUSTOMER = "CUSTOMER"
+    TRIP_EXTRA = "TRIP_EXTRA"
