@@ -493,6 +493,7 @@ async def payment_order(booking_id: str, user: dict[str, Any] = Depends(current_
     booking = await store.find_one("bookings", {"_id": booking_id})
     if not booking or (user["role"] == "CUSTOMER" and booking["customer_id"] != user["_id"]):
         raise HTTPException(status_code=404, detail="Booking not found")
+    test_payments_enabled = settings.app_env != "production" or settings.allow_test_payments
     existing = await store.find_one("payments", {"booking_id": booking_id})
     if existing:
         if existing.get("status") == "PAID":
@@ -501,12 +502,12 @@ async def payment_order(booking_id: str, user: dict[str, Any] = Depends(current_
             amount, payment_type, platform = await payment_policy(booking)
             order_id = f"ridex_{uuid4().hex[:16]}"
             upi_id = platform.get("upi_id", "ridex@upi")
-            existing = await store.update("payments", existing["_id"], {"provider_order_id": order_id, "amount": amount, "booking_total": booking["total"], "currency": booking["currency"], "status": "CREATED", "method": "UPI_QR", "payment_type": payment_type, "upi_id": upi_id, "upi_uri": upi_payment_uri(upi_id, amount, order_id), "demo": settings.app_env != "production"}) or existing
-        return {**(public(existing) or {}), "qr_url": f"/payments/{existing['_id']}/qr"}
+            existing = await store.update("payments", existing["_id"], {"provider_order_id": order_id, "amount": amount, "booking_total": booking["total"], "currency": booking["currency"], "status": "CREATED", "method": "UPI_QR", "payment_type": payment_type, "upi_id": upi_id, "upi_uri": upi_payment_uri(upi_id, amount, order_id), "demo": test_payments_enabled}) or existing
+        return {**(public(existing) or {}), "demo": test_payments_enabled, "qr_url": f"/payments/{existing['_id']}/qr"}
     amount, payment_type, platform = await payment_policy(booking)
     order_id = f"ridex_{uuid4().hex[:16]}"
     upi_id = platform.get("upi_id", "ridex@upi")
-    payment = await store.insert("payments", {"booking_id": booking_id, "provider_order_id": order_id, "amount": amount, "booking_total": booking["total"], "currency": booking["currency"], "status": "CREATED", "method": "UPI_QR", "payment_type": payment_type, "upi_id": upi_id, "upi_uri": upi_payment_uri(upi_id, amount, order_id), "demo": settings.app_env != "production"})
+    payment = await store.insert("payments", {"booking_id": booking_id, "provider_order_id": order_id, "amount": amount, "booking_total": booking["total"], "currency": booking["currency"], "status": "CREATED", "method": "UPI_QR", "payment_type": payment_type, "upi_id": upi_id, "upi_uri": upi_payment_uri(upi_id, amount, order_id), "demo": test_payments_enabled})
     return {**(public(payment) or {}), "qr_url": f"/payments/{payment['_id']}/qr"}
 
 
@@ -527,7 +528,7 @@ async def payment_qr(payment_id: str, user: dict[str, Any] = Depends(current_use
 
 @app.post(f"{settings.api_prefix}/payments/{{payment_id}}/demo-confirm", dependencies=[Depends(verify_access_token)])
 async def demo_confirm(payment_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    if settings.app_env == "production":
+    if settings.app_env == "production" and not settings.allow_test_payments:
         raise HTTPException(status_code=404, detail="Not available")
     payment = await store.find_one("payments", {"_id": payment_id})
     if not payment:

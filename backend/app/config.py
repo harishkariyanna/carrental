@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     razorpay_key_id: str = ""
     razorpay_key_secret: str = ""
     razorpay_webhook_secret: str = ""
+    allow_test_payments: bool = False
 
     smtp_host: str = ""
     smtp_port: int = 587
