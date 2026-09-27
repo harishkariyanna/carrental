@@ -37,7 +37,9 @@ export function LoginModal({ open, initialMode = 'login', onClose, onAuthenticat
   const register = async (event: FormEvent) => {
     event.preventDefault(); setError(''); setBusy(true)
     try {
-      const result = await api<{ access_token: string }>('/auth/register', { method: 'POST', body: JSON.stringify(registration) })
+      const { license_number, license_expiry, ...customerRegistration } = registration
+      const payload = registration.role === 'DRIVER' ? registration : customerRegistration
+      const result = await api<{ access_token: string }>('/auth/register', { method: 'POST', body: JSON.stringify(payload) })
       setJwt(result.access_token)
       const user = userFromJwt()
       if (!user) throw new Error('The registration token was invalid')
