@@ -195,6 +195,7 @@ class DriverCreate(BaseModel):
 class DriverUpdate(BaseModel):
     status: Literal["ACTIVE", "INACTIVE"] | None = None
     availability: Literal["AVAILABLE", "OFFLINE"] | None = None
+    schedule_availability: Literal["AVAILABLE", "UNAVAILABLE"] | None = None
     verification_status: Literal["PENDING", "VERIFIED", "REJECTED"] | None = None
     license_number: str | None = Field(default=None, min_length=4, max_length=40)
     license_expiry: str | None = None
@@ -254,6 +255,8 @@ class PlatformSettingsUpdate(BaseModel):
     google_review_url: str | None = Field(default=None, max_length=500)
     maintenance_mode: bool | None = None
     upi_id: str | None = Field(default=None, min_length=3, max_length=100)
+    standard_advance_type: Literal["PERCENTAGE", "FIXED"] | None = None
+    standard_advance_value: int | None = Field(default=None, ge=0)
     airport_advance_type: Literal["PERCENTAGE", "FIXED"] | None = None
     airport_advance_value: int | None = Field(default=None, ge=0)
     outstation_advance_type: Literal["PERCENTAGE", "FIXED"] | None = None
@@ -261,6 +264,8 @@ class PlatformSettingsUpdate(BaseModel):
 
     @model_validator(mode="after")
     def validate_advance_values(self):
+        if self.standard_advance_type == "PERCENTAGE" and self.standard_advance_value is not None and self.standard_advance_value > 100:
+            raise ValueError("Local and hourly advance percentage cannot exceed 100")
         if self.airport_advance_type == "PERCENTAGE" and self.airport_advance_value is not None and self.airport_advance_value > 100:
             raise ValueError("Airport advance percentage cannot exceed 100")
         if self.outstation_advance_type == "PERCENTAGE" and self.outstation_advance_value is not None and self.outstation_advance_value > 100:

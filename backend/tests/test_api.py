@@ -158,6 +158,25 @@ def test_personal_coupon_is_restricted_to_selected_customer() -> None:
         assert allowed.json()["results"][0]["pricing"]["coupon"]["discount"] == 300
 
 
+def test_coupon_minimum_does_not_hide_ineligible_cars() -> None:
+    with TestClient(app) as client:
+        login(client, "admin@mailinator.com", "AdminTest@123")
+        created = client.post("/api/v1/admin/coupons", json={"code": "MIXEDFARE", "discount_type": "PERCENTAGE", "value": 10, "minimum_booking": 1800, "maximum_discount": 500, "valid_from": (datetime.now(UTC) - timedelta(days=1)).isoformat(), "valid_to": (datetime.now(UTC) + timedelta(days=30)).isoformat(), "usage_limit": 100, "scope": "PUBLIC", "status": "ACTIVE"})
+        assert created.status_code == 201
+        coupon_record = next(item for item in store.memory["coupons"] if item["code"] == "MIXEDFARE")
+        coupon_record["valid_from"] = coupon_record["valid_from"].replace(tzinfo=None)
+        coupon_record["valid_to"] = coupon_record["valid_to"].replace(tzinfo=None)
+        assert any(item["code"] == "MIXEDFARE" for item in client.get("/api/v1/coupons/public").json())
+        login(client, "ridex.customer@mailinator.com", "Customer@123")
+        response = client.post("/api/v1/quotes", json={"service_type": "AIRPORT", "pickup": "Whitefield", "destination": "BLR Airport", "scheduled_at": "2027-02-01T10:00:00+05:30", "passengers": 2, "luggage": 1, "coupon_code": "MIXEDFARE"})
+        assert response.status_code == 200
+        body = response.json()
+        assert len(body["results"]) == 4
+        assert any(item["pricing"].get("coupon") for item in body["results"])
+        assert any(item["pricing"].get("coupon_ineligible_reason") for item in body["results"])
+        assert body["coupon_message"].startswith("Coupon requires a minimum fare")
+
+
 def test_local_waiting_is_driver_started_and_automatically_billed() -> None:
     with TestClient(app) as client:
         driver_token = login(client, "ridex.driver@mailinator.com", "Driver@123")
@@ -255,7 +274,7 @@ def test_customer_quote_booking_and_payment() -> None:
 def test_advance_upi_qr_payment_is_persisted_and_idempotent() -> None:
     with TestClient(app) as client:
         admin_token = login(client, "admin@mailinator.com", "AdminTest@123")
-        settings_response = client.patch("/api/v1/admin/settings", json={"upi_id": "ridex-test@upi", "airport_advance_type": "PERCENTAGE", "airport_advance_value": 25, "outstation_advance_type": "FIXED", "outstation_advance_value": 1500})
+        settings_response = client.patch("/api/v1/admin/settings", json={"upi_id": "ridex-test@upi", "standard_advance_type": "PERCENTAGE", "standard_advance_value": 25, "airport_advance_type": "PERCENTAGE", "airport_advance_value": 25, "outstation_advance_type": "FIXED", "outstation_advance_value": 1500})
         assert settings_response.status_code == 200
         customer_token = login(client, "ridex.customer@mailinator.com", "Customer@123")
         quote = client.post("/api/v1/quotes", json={"service_type": "AIRPORT", "pickup": "Marathahalli", "destination": "BLR Airport", "scheduled_at": "2026-12-01T10:00:00+05:30", "passengers": 2, "luggage": 2}).json()["results"][0]
@@ -290,6 +309,12 @@ def test_advance_upi_qr_payment_is_persisted_and_idempotent() -> None:
         outstation_amount, payment_type, _ = __import__("asyncio").run(payment_policy({"service_type": "OUTSTATION", "total": 5000}))
         assert outstation_amount == 1500
         assert payment_type == "ADVANCE_FIXED"
+        standard_amount, standard_type, _ = __import__("asyncio").run(payment_policy({"service_type": "NORMAL", "total": 100}))
+        assert standard_amount == 25
+        assert standard_type == "ADVANCE_PERCENTAGE"
+        preview = client.get("/api/v1/payment-policy/preview", params={"service_type": "NORMAL", "total": 100})
+        assert preview.status_code == 200
+        assert preview.json() == {"amount": 25, "remaining": 75, "booking_total": 100, "payment_type": "ADVANCE_PERCENTAGE"}
 
 
 def test_role_boundaries_and_driver_transition() -> None:
@@ -306,6 +331,159 @@ def test_role_boundaries_and_driver_transition() -> None:
             assert response.status_code == 200
             assert response.json()["status"] == expected
         assert client.post(f"/api/v1/driver/trips/{booking_id}/start", json={"action_id": "bypass-start"}).status_code == 404
+
+
+def test_pending_booking_and_qr_are_repriced_after_coupon() -> None:
+    with TestClient(app) as client:
+        admin_token = login(client, "admin@mailinator.com", "AdminTest@123")
+        client.patch("/api/v1/admin/settings", json={"standard_advance_type": "PERCENTAGE", "standard_advance_value": 25, "airport_advance_type": "PERCENTAGE", "airport_advance_value": 25})
+        coupon = client.post("/api/v1/admin/coupons", json={"code": "CHECKOUT20", "discount_type": "PERCENTAGE", "value": 20, "minimum_booking": 500, "maximum_discount": 1000, "valid_from": (datetime.now(UTC) - timedelta(days=1)).isoformat(), "valid_to": (datetime.now(UTC) + timedelta(days=30)).isoformat(), "usage_limit": 100, "scope": "PUBLIC", "status": "ACTIVE"})
+        assert coupon.status_code == 201
+        login(client, "ridex.customer@mailinator.com", "Customer@123")
+        request = {"service_type": "AIRPORT", "pickup": "Whitefield", "destination": "BLR Airport", "scheduled_at": "2027-03-01T10:00:00+05:30", "passengers": 2, "luggage": 1}
+        base_quotes = client.post("/api/v1/quotes", json=request).json()["results"]
+        base_quote = base_quotes[0]
+        payload = {"quote_id": base_quote["quote_id"], "vehicle_id": base_quote["vehicle"]["id"], "passenger_name": "Harish Kumar", "passenger_phone": "+919876543210", "special_instructions": ""}
+        booking = client.post("/api/v1/bookings", json=payload).json()
+        original_payment = client.post(f"/api/v1/bookings/{booking['id']}/payment-order").json()
+        assert original_payment["amount"] == round(base_quote["total"] * 0.25)
+
+        discounted_quotes = client.post("/api/v1/quotes", json={**request, "coupon_code": "CHECKOUT20"}).json()["results"]
+        discounted_quote = next(item for item in discounted_quotes if item["vehicle"]["id"] == base_quote["vehicle"]["id"])
+        repriced_booking = client.post("/api/v1/bookings", json={**payload, "quote_id": discounted_quote["quote_id"]})
+        assert repriced_booking.status_code == 201
+        assert repriced_booking.json()["id"] == booking["id"]
+        assert repriced_booking.json()["total"] == discounted_quote["total"]
+        refreshed_payment = client.post(f"/api/v1/bookings/{booking['id']}/payment-order")
+        assert refreshed_payment.status_code == 200
+        assert refreshed_payment.json()["id"] == original_payment["id"]
+        assert refreshed_payment.json()["booking_total"] == discounted_quote["total"]
+        assert refreshed_payment.json()["amount"] == round(discounted_quote["total"] * 0.25)
+        assert refreshed_payment.json()["provider_order_id"] != original_payment["provider_order_id"]
+        confirmed = client.post(f"/api/v1/payments/{refreshed_payment.json()['id']}/demo-confirm")
+        assert confirmed.status_code == 200
+        client.headers["Authorization"] = f"Bearer {admin_token}"
+        admin_payment = next(item for item in client.get("/api/v1/admin/payments").json() if item["id"] == refreshed_payment.json()["id"])
+        assert admin_payment["booking_total"] == discounted_quote["total"]
+        assert admin_payment["paid_amount"] == refreshed_payment.json()["amount"]
+        assert admin_payment["driver_collected_amount"] == 0
+        assert admin_payment["balance_due"] == discounted_quote["total"] - refreshed_payment.json()["amount"]
+
+
+def test_vehicle_default_driver_auto_assignment_and_schedule_aware_reassignment() -> None:
+    with TestClient(app) as client:
+        admin_token = login(client, "admin@mailinator.com", "AdminTest@123")
+        default_assignment = client.post("/api/v1/admin/vehicles/city/assign-driver", json={"driver_id": "driver-demo"})
+        assert default_assignment.status_code == 200
+        default_profile = next(item for item in store.memory["drivers"] if item["user_id"] == "driver-demo")
+        assert default_profile["online_status"] == "OFFLINE"
+        assert default_profile["schedule_availability"] == "AVAILABLE"
+
+        second_driver = client.post("/api/v1/admin/drivers", json={"name": "Available Driver", "email": "available.driver@mailinator.com", "phone": "+919844445555", "password": "Available@123", "license_number": "KA02-2026-5555", "license_expiry": "2030-12-31"})
+        assert second_driver.status_code == 201
+        second_driver_id = second_driver.json()["id"]
+        second_profile = next(item for item in store.memory["drivers"] if item["user_id"] == second_driver_id)
+        second_profile["documents_status"] = "SUBMITTED"
+        approved = client.patch(f"/api/v1/admin/drivers/{second_driver_id}", json={"verification_status": "VERIFIED", "schedule_availability": "AVAILABLE"})
+        assert approved.status_code == 200
+
+        customer_token = login(client, "ridex.customer@mailinator.com", "Customer@123")
+        quote = client.post("/api/v1/quotes", json={"service_type": "AIRPORT", "pickup": "Whitefield", "destination": "BLR Airport", "scheduled_at": "2027-01-10T10:00:00+05:30", "passengers": 2, "luggage": 1}).json()["results"]
+        city_quote = next(item for item in quote if item["vehicle"]["id"] == "city")
+        booking = client.post("/api/v1/bookings", json={"quote_id": city_quote["quote_id"], "vehicle_id": "city", "passenger_name": "Harish Kumar", "passenger_phone": "+919876543210", "special_instructions": ""}).json()
+        payment = client.post(f"/api/v1/bookings/{booking['id']}/payment-order").json()
+        confirmed = client.post(f"/api/v1/payments/{payment['id']}/demo-confirm")
+        assert confirmed.status_code == 200
+        assert confirmed.json()["status"] == "DRIVER_ASSIGNED"
+        assert confirmed.json()["driver_id"] == "driver-demo"
+        assert confirmed.json()["assignment_status"] == "AUTO_ASSIGNED"
+        assert any(item["booking_id"] == booking["id"] and item["driver_id"] == "driver-demo" for item in store.memory["driver_reservations"])
+
+        client.headers["Authorization"] = f"Bearer {admin_token}"
+        available = client.get(f"/api/v1/admin/bookings/{booking['id']}/available-drivers")
+        assert available.status_code == 200
+        assert next(item for item in available.json() if item["id"] == second_driver_id)["available"] is True
+        reassigned = client.post(f"/api/v1/admin/bookings/{booking['id']}/assign-driver", json={"driver_id": second_driver_id})
+        assert reassigned.status_code == 200
+        assert reassigned.json()["driver_id"] == second_driver_id
+        assert reassigned.json()["assignment_status"] == "ADMIN_ASSIGNED"
+        assert not any(item["booking_id"] == booking["id"] and item["driver_id"] == "driver-demo" for item in store.memory["driver_reservations"])
+
+        login(client, "ridex.driver@mailinator.com", "Driver@123")
+        assert all(item["id"] != booking["id"] for item in client.get("/api/v1/driver/trips").json())
+        login(client, "available.driver@mailinator.com", "Available@123")
+        assert any(item["id"] == booking["id"] for item in client.get("/api/v1/driver/trips").json())
+
+        seed_booking = next(item for item in store.memory["bookings"] if item["_id"] == "booking-demo")
+        client.headers["Authorization"] = f"Bearer {customer_token}"
+        conflict_quotes = client.post("/api/v1/quotes", json={"service_type": "AIRPORT", "pickup": "Whitefield", "destination": "BLR Airport", "scheduled_at": seed_booking["scheduled_at"], "passengers": 2, "luggage": 1}).json()["results"]
+        conflict_quote = next(item for item in conflict_quotes if item["vehicle"]["id"] == "city")
+        conflict_booking = client.post("/api/v1/bookings", json={"quote_id": conflict_quote["quote_id"], "vehicle_id": "city", "passenger_name": "Harish Kumar", "passenger_phone": "+919876543210", "special_instructions": ""}).json()
+        conflict_payment = client.post(f"/api/v1/bookings/{conflict_booking['id']}/payment-order").json()
+        conflict_confirmed = client.post(f"/api/v1/payments/{conflict_payment['id']}/demo-confirm")
+        assert conflict_confirmed.status_code == 200
+        assert conflict_confirmed.json()["status"] == "CONFIRMED"
+        assert conflict_confirmed.json()["driver_id"] is None
+        assert conflict_confirmed.json()["assignment_status"] == "AWAITING_ADMIN"
+        assert "Overlaps" in conflict_confirmed.json()["assignment_reason"]
+
+        client.headers["Authorization"] = f"Bearer {admin_token}"
+        conflict_available = client.get(f"/api/v1/admin/bookings/{conflict_booking['id']}/available-drivers").json()
+        default_option = next(item for item in conflict_available if item["id"] == "driver-demo")
+        alternate_option = next(item for item in conflict_available if item["id"] == second_driver_id)
+        assert default_option["available"] is False
+        assert "Overlaps" in default_option["unavailable_reason"]
+        assert alternate_option["available"] is True
+        blocked = client.post(f"/api/v1/admin/bookings/{conflict_booking['id']}/assign-driver", json={"driver_id": "driver-demo"})
+        assert blocked.status_code == 409
+        assigned_alternate = client.post(f"/api/v1/admin/bookings/{conflict_booking['id']}/assign-driver", json={"driver_id": second_driver_id})
+        assert assigned_alternate.status_code == 200
+        assert assigned_alternate.json()["driver_id"] == second_driver_id
+
+
+def test_inactive_driver_old_token_is_rejected() -> None:
+    with TestClient(app) as client:
+        driver_token = login(client, "ridex.driver@mailinator.com", "Driver@123")
+        admin_token = login(client, "admin@mailinator.com", "AdminTest@123")
+        deactivated = client.patch("/api/v1/admin/drivers/driver-demo", json={"status": "INACTIVE"})
+        assert deactivated.status_code == 200
+        client.headers["Authorization"] = f"Bearer {driver_token}"
+        assert client.get("/api/v1/driver/dashboard").status_code == 403
+        assert client.get("/api/v1/driver/trips").status_code == 403
+        assert client.post("/api/v1/trip-operations/booking-demo/location", json={"latitude": 12.97, "longitude": 77.59}).status_code == 403
+
+
+def test_advance_balance_collection_and_shared_live_location() -> None:
+    with TestClient(app) as client:
+        booking = next(item for item in store.memory["bookings"] if item["_id"] == "booking-demo")
+        booking.update({"status": "TRIP_STARTED", "payment_status": "ADVANCE_PAID", "quoted_total": 100, "total": 100, "paid_amount": 25, "balance_due": 75, "line_items": [{"code": "BASE", "label": "Ride fare", "amount": 100}], "drop_latitude": 12.9716, "drop_longitude": 77.5946})
+        driver_token = login(client, "ridex.driver@mailinator.com", "Driver@123")
+        location = client.post("/api/v1/trip-operations/booking-demo/location", json={"latitude": 12.9716, "longitude": 77.5946, "accuracy": 8})
+        assert location.status_code == 200
+        assert "live_locations" not in store.memory
+
+        view = client.get("/api/v1/trip-operations/booking-demo").json()
+        assert view["payment_summary"]["paid_amount"] == 25
+        assert view["payment_summary"]["driver_collected_amount"] == 0
+        assert view["payment_summary"]["amount_to_collect"] == 75
+        blocked = client.post("/api/v1/trip-operations/booking-demo/request-end", json={"latitude": 12.9716, "longitude": 77.5946})
+        assert blocked.status_code == 409
+        assert "₹75" in blocked.json()["detail"]
+        assert client.post("/api/v1/trip-operations/booking-demo/record-balance", json={"method": "CARD"}).status_code == 422
+        collected = client.post("/api/v1/trip-operations/booking-demo/record-balance", json={"method": "UPI"})
+        assert collected.status_code == 200
+        assert collected.json()["amount_received"] == 75
+        assert booking["driver_collected_amount"] == 75
+        assert booking["balance_payment_method"] == "UPI"
+
+        admin_token = login(client, "admin@mailinator.com", "AdminTest@123")
+        admin_booking = next(item for item in client.get("/api/v1/admin/bookings").json() if item["id"] == "booking-demo")
+        assert admin_booking["driver_location"]["latitude"] == 12.9716
+        assert admin_booking["driver_collected_amount"] == 75
+        client.headers["Authorization"] = f"Bearer {driver_token}"
+        completed = client.post("/api/v1/trip-operations/booking-demo/request-end", json={"latitude": 12.9716, "longitude": 77.5946})
+        assert completed.status_code == 200
+        assert completed.json()["status"] == "TRIP_COMPLETED"
 
 
 def test_forgot_password_stores_only_hashed_otp() -> None:
@@ -503,17 +681,19 @@ def test_jwt_claims_and_customer_account_apis() -> None:
 def test_driver_online_status_requires_and_stores_location() -> None:
     with TestClient(app) as client:
         login(client, "ridex.driver@mailinator.com", "Driver@123")
-        missing_location = client.patch("/api/v1/driver/availability", json={"availability": "AVAILABLE"})
+        missing_location = client.patch("/api/v1/driver/availability", json={"online_status": "ONLINE"})
         assert missing_location.status_code == 422
-        online = client.patch("/api/v1/driver/availability", json={"availability": "AVAILABLE", "latitude": "12.971599", "longitude": "77.594566"})
+        online = client.patch("/api/v1/driver/availability", json={"online_status": "ONLINE", "latitude": "12.971599", "longitude": "77.594566"})
         assert online.status_code == 200
-        assert online.json()["availability"] == "AVAILABLE"
+        assert online.json()["online_status"] == "ONLINE"
+        assert online.json()["schedule_availability"] == "AVAILABLE"
         assert online.json()["latitude"] == 12.971599
         assert online.json()["longitude"] == 77.594566
         assert online.json()["last_seen"]
-        offline = client.patch("/api/v1/driver/availability", json={"availability": "OFFLINE"})
+        offline = client.patch("/api/v1/driver/availability", json={"online_status": "OFFLINE"})
         assert offline.status_code == 200
-        assert offline.json()["availability"] == "OFFLINE"
+        assert offline.json()["online_status"] == "OFFLINE"
+        assert offline.json()["schedule_availability"] == "AVAILABLE"
 
 
 def test_media_blob_and_trip_otp_extra_completion_workflow() -> None:
@@ -575,12 +755,23 @@ def test_media_blob_and_trip_otp_extra_completion_workflow() -> None:
         toll = client.post(f"/api/v1/trip-operations/{booking_id}/extras", json={"type": "TOLL", "amount": 250, "note": "Highway toll", "media_id": evidence.json()["id"]})
         assert toll.status_code == 201
         driver_view = client.get(f"/api/v1/trip-operations/{booking_id}").json()
-        assert driver_view["payment_summary"] == {"quoted_total": 3499, "paid_amount": 3499, "additional_charges": 550, "final_total": 4049, "amount_to_collect": 550}
+        assert driver_view["payment_summary"] == {"quoted_total": 3499, "paid_amount": 3499, "driver_collected_amount": 0, "additional_charges": 550, "final_total": 4049, "amount_to_collect": 550}
         booking_document.update({"drop_latitude": 13.0, "drop_longitude": 77.6})
+        blocked_end = client.post(f"/api/v1/trip-operations/{booking_id}/request-end", json={"latitude": 12.9716, "longitude": 77.5946})
+        assert blocked_end.status_code == 409
+        assert "₹550" in blocked_end.json()["detail"]
+        balance = client.post(f"/api/v1/trip-operations/{booking_id}/record-balance", json={"method": "CASH"})
+        assert balance.status_code == 200
+        assert balance.json()["amount_received"] == 550
+        assert balance.json()["method"] == "CASH"
         end_request = client.post(f"/api/v1/trip-operations/{booking_id}/request-end", json={"latitude": 12.9716, "longitude": 77.5946})
         assert end_request.json()["purpose"] == "DRIVER_END"
+        expired_end_otp = next(item for item in store.memory["trip_otps"] if item["booking_id"] == booking_id and item["purpose"] == "DRIVER_END" and not item["consumed"])
+        expired_end_otp["expires_at"] = datetime.now(UTC) - timedelta(seconds=1)
         client.headers["Authorization"] = f"Bearer {customer_token}"
         end_otp = client.get(f"/api/v1/trip-operations/{booking_id}/otp/DRIVER_END").json()["code"]
+        assert expired_end_otp["status"] == "EXPIRED"
+        assert next(item for item in store.memory["trip_otps"] if item["booking_id"] == booking_id and item["purpose"] == "DRIVER_END" and not item["consumed"])["status"] == "ACTIVE"
         customer_cannot_complete = client.post(f"/api/v1/trip-operations/{booking_id}/request-end", json={})
         assert customer_cannot_complete.status_code == 403
         client.headers["Authorization"] = f"Bearer {driver_token}"
@@ -588,6 +779,7 @@ def test_media_blob_and_trip_otp_extra_completion_workflow() -> None:
         assert completed.status_code == 200
         assert completed.json()["status"] == "TRIP_COMPLETED"
         assert completed.json()["extra_total"] == 250
+        assert next(item for item in reversed(store.memory["trip_otps"]) if item["booking_id"] == booking_id and item["purpose"] == "DRIVER_END")["status"] == "VERIFIED"
 
         booking_document.update({"status": "TRIP_STARTED"})
         client.headers["Authorization"] = f"Bearer {driver_token}"

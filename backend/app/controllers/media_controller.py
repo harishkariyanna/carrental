@@ -3,7 +3,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile
 
 from ..core.enums import MediaEntityType
-from ..dependencies import get_store
+from ..dependencies import get_store, require_active_driver, require_active_roles
 from ..repositories.media_repository import MediaRepository
 from ..security import require_roles
 from ..services.media_service import MediaService
@@ -29,7 +29,7 @@ async def upload_admin_media(entity_type: MediaEntityType, entity_id: str, file:
 
 
 @router.post("/me/profile-image", status_code=201)
-async def upload_profile_image(file: UploadFile, claims=Depends(require_roles("CUSTOMER", "DRIVER")), store=Depends(get_store)):
+async def upload_profile_image(file: UploadFile, claims=Depends(require_active_roles("CUSTOMER", "DRIVER")), store=Depends(get_store)):
     entity_type = MediaEntityType.CUSTOMER if claims["role"] == "CUSTOMER" else MediaEntityType.DRIVER
     media = await MediaService(MediaRepository(store)).upload(entity_type, claims["sub"], file, claims["sub"])
     await store.update("users", claims["sub"], {"profile_image_id": media["id"]})
@@ -37,7 +37,7 @@ async def upload_profile_image(file: UploadFile, claims=Depends(require_roles("C
 
 
 @router.post("/driver/documents/{document_type}", status_code=201)
-async def upload_driver_document(document_type: Literal["LICENSE", "VEHICLE_PHOTO", "ADDRESS_PROOF"], file: UploadFile, claims=Depends(require_roles("DRIVER")), store=Depends(get_store)):
+async def upload_driver_document(document_type: Literal["LICENSE", "VEHICLE_PHOTO", "ADDRESS_PROOF"], file: UploadFile, claims=Depends(require_active_driver), store=Depends(get_store)):
     profile = await store.find_one("drivers", {"user_id": claims["sub"]})
     if not profile:
         raise HTTPException(status_code=404, detail="Driver profile not found")
@@ -52,7 +52,7 @@ async def upload_driver_document(document_type: Literal["LICENSE", "VEHICLE_PHOT
     return {**media, "documents_status": "SUBMITTED" if complete else "INCOMPLETE"}
 
 @router.post("/trip-operations/{booking_id}/evidence", status_code=201)
-async def upload_trip_evidence(booking_id: str, file: UploadFile, claims=Depends(require_roles("DRIVER")), store=Depends(get_store)):
+async def upload_trip_evidence(booking_id: str, file: UploadFile, claims=Depends(require_active_driver), store=Depends(get_store)):
     booking = await store.find_one("bookings", {"_id": booking_id, "driver_id": claims["sub"]})
     if not booking:
         raise HTTPException(status_code=404, detail="Assigned trip not found")

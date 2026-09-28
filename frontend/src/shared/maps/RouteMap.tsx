@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import L from 'leaflet'
-import { MapContainer, Marker, Polyline, TileLayer, useMap } from 'react-leaflet'
+import { MapPin, Navigation, X } from 'lucide-react'
+import { MapContainer, Marker, Polyline, TileLayer, useMap, useMapEvents } from 'react-leaflet'
 import 'leaflet/dist/leaflet.css'
 import { api } from '../../api'
 
@@ -54,4 +55,39 @@ export function LocationSearch({ label, value, point, onSelect }: { label: strin
     try { setResults(await api(`/maps/geocode?q=${encodeURIComponent(value)}`)) } finally { setLoading(false) }
   }
   return <div className="location-search"><label className="field"><span>{label}</span><div><input value={value} onChange={(event) => onSelect(event.target.value, point)} required /><button type="button" onClick={search}>{loading ? '...' : 'Search'}</button></div></label>{results.length>0&&<div className="location-results">{results.map((result)=><button type="button" key={`${result.latitude}-${result.longitude}`} onClick={()=>{onSelect(result.label,result);setResults([])}}>{result.label}</button>)}</div>}</div>
+}
+
+function TrackMapCenter({ onChange }: { onChange: (point: MapPoint) => void }) {
+  const map = useMapEvents({ moveend: () => { const center = map.getCenter(); onChange({ latitude: center.lat, longitude: center.lng }) } })
+  return null
+}
+
+function RecenterMap({ point }: { point: MapPoint }) {
+  const map = useMap()
+  useEffect(() => { map.flyTo([point.latitude, point.longitude], Math.max(map.getZoom(), 16), { duration: 0.7 }) }, [map, point])
+  return null
+}
+
+export function MapLocationPicker({ title, initial, onConfirm, onClose }: { title: string; initial?: MapPoint; onConfirm: (point: MapPoint) => void; onClose: () => void }) {
+  const fallback = { latitude: 12.9716, longitude: 77.5946 }
+  const [selected, setSelected] = useState<MapPoint>(initial ?? fallback)
+  const [recenter, setRecenter] = useState<MapPoint>(initial ?? fallback)
+  const [address, setAddress] = useState(initial?.label ?? '')
+  const [loading, setLoading] = useState(true)
+  const [message, setMessage] = useState('')
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const params = new URLSearchParams({ latitude: String(selected.latitude), longitude: String(selected.longitude) })
+      void api<{ label: string }>(`/maps/reverse?${params}`).then((result) => { setAddress(result.label); setMessage('') }).catch((reason: Error) => { setAddress(`${selected.latitude.toFixed(6)}, ${selected.longitude.toFixed(6)}`); setMessage(reason.message) }).finally(() => setLoading(false))
+    }, 700)
+    return () => clearTimeout(timer)
+  }, [selected.latitude, selected.longitude])
+
+  const useCurrentLocation = () => {
+    if (!navigator.geolocation) { setMessage('Location is not supported by this browser.'); return }
+    navigator.geolocation.getCurrentPosition(({ coords }) => { const point = { latitude: coords.latitude, longitude: coords.longitude }; setLoading(true); setSelected(point); setRecenter(point) }, () => setMessage('Allow location access to use your current position.'), { enableHighAccuracy: true, timeout: 10_000 })
+  }
+
+  return <div className="map-picker-backdrop" role="presentation"><section className="map-picker" role="dialog" aria-modal="true" aria-labelledby="map-picker-title"><header><div><p className="eyebrow">SELECT ON MAP</p><h2 id="map-picker-title">{title}</h2></div><button type="button" className="icon-button" aria-label="Close map picker" onClick={onClose}><X/></button></header><div className="center-pin-map"><MapContainer center={[selected.latitude, selected.longitude]} zoom={16} scrollWheelZoom><TileLayer attribution="&copy; OpenStreetMap contributors" url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"/><TrackMapCenter onChange={(point) => { setLoading(true); setSelected(point) }}/><RecenterMap point={recenter}/></MapContainer><div className="fixed-center-pin" aria-hidden="true"><MapPin/></div></div><button type="button" className="location-link map-current-location" onClick={useCurrentLocation}><Navigation/> Use my current location</button><div className="map-address-preview"><small>SELECTED LOCATION</small><strong>{loading ? 'Finding address...' : address}</strong>{message&&<span>{message}</span>}</div><button type="button" className="button wide" disabled={loading || !address} onClick={() => onConfirm({ ...selected, label: address })}>Confirm Location</button></section></div>
 }

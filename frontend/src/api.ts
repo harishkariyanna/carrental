@@ -73,6 +73,8 @@ export interface Quote {
     included_distance_km?: number
     estimated_duration_minutes?: number
     trip_days?: number
+    coupon_ineligible_reason?: string
+    coupon?: { id: string; code: string; discount: number; scope: string }
   }
 }
 
@@ -101,6 +103,9 @@ export interface Booking {
   waiting_grace_minutes?: number
   waiting_rate_per_minute?: number
   paid_amount?: number
+  driver_collected_amount?: number
+  balance_payment_method?: 'CASH' | 'UPI'
+  balance_collected_at?: string
   balance_due?: number
   quoted_total?: number
   extra_total?: number

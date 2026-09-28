@@ -41,7 +41,7 @@ class TripService:
 
     async def update_location(self, booking_id: str, driver_id: str, latitude: float, longitude: float, accuracy: float | None) -> dict[str, Any]:
         booking = await self._assigned_booking(booking_id, driver_id)
-        if booking["status"] not in {BookingStatus.DRIVER_ACCEPTED, BookingStatus.DRIVER_ON_THE_WAY, BookingStatus.DRIVER_ARRIVED, BookingStatus.TRIP_STARTED}:
+        if booking["status"] not in {BookingStatus.DRIVER_ACCEPTED, BookingStatus.DRIVER_ON_THE_WAY, BookingStatus.DRIVER_ARRIVED, BookingStatus.TRIP_STARTED, BookingStatus.DESTINATION_REACHED, BookingStatus.COMPLETION_OTP_PENDING}:
             raise HTTPException(status_code=409, detail="Location updates are only accepted during an active assignment")
         location = live_locations.update(booking_id, driver_id, latitude, longitude, accuracy)
         response = {"latitude": latitude, "longitude": longitude, "accuracy": accuracy, "last_seen": location["last_seen"], "arrived": False}
@@ -82,15 +82,17 @@ class TripService:
     async def create_otp(self, booking: dict[str, Any], purpose: OtpPurpose, target_role: Role) -> None:
         code = f"{randbelow(1_000_000):06d}"
         digest, salt = hash_password(code)
-        await self.repository.add_otp({"booking_id": booking["_id"], "purpose": purpose.value, "target_role": target_role.value, "code_hash": digest, "code_salt": salt, "code_ciphertext": self.cipher.encrypt(code.encode()).decode(), "expires_at": datetime.now(UTC) + timedelta(minutes=15), "attempts": 0, "consumed": False})
+        await self.repository.add_otp({"booking_id": booking["_id"], "purpose": purpose.value, "target_role": target_role.value, "code_hash": digest, "code_salt": salt, "code_ciphertext": self.cipher.encrypt(code.encode()).decode(), "expires_at": datetime.now(UTC) + timedelta(minutes=15), "attempts": 0, "consumed": False, "status": "ACTIVE"})
 
     async def otp_for_role(self, booking_id: str, purpose: OtpPurpose, role: Role, user_id: str) -> dict[str, Any]:
         booking = await self._authorized_booking(booking_id, role, user_id)
         otp = await self.repository.active_otp(booking_id, purpose.value)
-        if purpose == OtpPurpose.START and role == Role.CUSTOMER and booking.get("status") == BookingStatus.DRIVER_ARRIVED and (not otp or as_utc(otp["expires_at"]) < datetime.now(UTC) or otp.get("attempts", 0) >= 5):
+        can_regenerate = role == Role.CUSTOMER and ((purpose == OtpPurpose.START and booking.get("status") == BookingStatus.DRIVER_ARRIVED) or (purpose == OtpPurpose.DRIVER_END and booking.get("status") in {BookingStatus.DESTINATION_REACHED, BookingStatus.COMPLETION_OTP_PENDING}))
+        if can_regenerate and (not otp or as_utc(otp["expires_at"]) < datetime.now(UTC) or otp.get("attempts", 0) >= 5):
             if otp:
-                await self.repository.consume_otp(otp["_id"])
-            await self.create_otp(booking, OtpPurpose.START, Role.CUSTOMER)
+                otp_status = "EXPIRED" if as_utc(otp["expires_at"]) < datetime.now(UTC) else "CANCELLED"
+                await self.repository.consume_otp(otp["_id"], otp_status)
+            await self.create_otp(booking, purpose, Role.CUSTOMER)
             otp = await self.repository.active_otp(booking_id, purpose.value)
         if not otp or otp["target_role"] != role.value or as_utc(otp["expires_at"]) < datetime.now(UTC):
             raise HTTPException(status_code=404, detail="No active OTP for this user")
@@ -122,18 +124,30 @@ class TripService:
         if actor_role != Role.DRIVER:
             raise HTTPException(status_code=403, detail="Only the assigned driver can complete a trip")
         booking = await self._assigned_booking(booking_id, user_id)
-        if booking["status"] != BookingStatus.TRIP_STARTED:
+        if booking["status"] not in {BookingStatus.TRIP_STARTED, BookingStatus.DESTINATION_REACHED, BookingStatus.COMPLETION_OTP_PENDING}:
             raise HTTPException(status_code=409, detail="Trip must be started before completion")
+        recalculated = await self._recalculate(booking)
+        if int(recalculated.get("balance_due", 0)) > 0:
+            raise HTTPException(status_code=409, detail=f"Record the final balance payment of ₹{recalculated['balance_due']} before completing the trip")
+        booking = await self._assigned_booking(booking_id, user_id)
         distance = None
         if latitude is not None and longitude is not None and booking.get("drop_latitude") is not None and booking.get("drop_longitude") is not None:
             distance = distance_meters(latitude, longitude, float(booking["drop_latitude"]), float(booking["drop_longitude"]))
-            if distance <= COMPLETION_RADIUS_METERS:
-                return await self.complete(booking)
+        reached_at = datetime.now(UTC)
+        reached_destination = distance is not None and distance <= COMPLETION_RADIUS_METERS
+        if reached_destination:
+            booking = await self.repository.update_booking(booking_id, {"status": BookingStatus.DESTINATION_REACHED, "destination_reached_at": reached_at, "version": booking.get("version", 1) + 1}) or booking
+            return await self.complete(booking)
+        if booking["status"] == BookingStatus.TRIP_STARTED:
+            changes = {"status": BookingStatus.COMPLETION_OTP_PENDING, "completion_otp_requested_at": reached_at, "version": booking.get("version", 1) + 1}
+            booking = await self.repository.update_booking(booking_id, changes) or booking
         otp = await self.repository.active_otp(booking_id, OtpPurpose.DRIVER_END.value)
         if not otp or as_utc(otp["expires_at"]) < datetime.now(UTC) or otp.get("attempts", 0) >= 5:
             if otp:
-                await self.repository.consume_otp(otp["_id"])
+                otp_status = "EXPIRED" if as_utc(otp["expires_at"]) < datetime.now(UTC) else "CANCELLED"
+                await self.repository.consume_otp(otp["_id"], otp_status)
             await self.create_otp(booking, OtpPurpose.DRIVER_END, Role.CUSTOMER)
+        await self.repository.add_notification(booking["customer_id"], "TRIP_COMPLETION_REQUESTED", "Trip completion requested", f"Share the completion OTP for booking {booking['public_id']} with your driver when you are ready to complete the trip.")
         return {
             "status": "OTP_REQUIRED",
             "purpose": OtpPurpose.DRIVER_END.value,
@@ -141,10 +155,25 @@ class TripService:
             "distance_m": round(distance) if distance is not None else None,
         }
 
+    async def record_balance(self, booking_id: str, driver_id: str, method: str) -> dict[str, Any]:
+        booking = await self._assigned_booking(booking_id, driver_id)
+        if booking["status"] not in {BookingStatus.TRIP_STARTED, BookingStatus.DESTINATION_REACHED, BookingStatus.COMPLETION_OTP_PENDING}:
+            raise HTTPException(status_code=409, detail="Final balance can only be recorded during an active trip")
+        recalculated = await self._recalculate(booking)
+        amount_due = int(recalculated.get("balance_due", 0))
+        if amount_due <= 0:
+            raise HTTPException(status_code=409, detail="This trip has no outstanding balance")
+        collected_total = int(booking.get("driver_collected_amount", 0)) + amount_due
+        updated = await self.repository.update_booking(booking_id, {"driver_collected_amount": collected_total, "balance_payment_method": method, "balance_collected_at": datetime.now(UTC), "balance_due": 0, "payment_status": "PAID", "version": booking.get("version", 1) + 1}) or booking
+        await self.repository.add_notification(booking["customer_id"], "BALANCE_RECEIVED", "Final balance received", f"Your driver recorded the remaining ₹{amount_due} by {method} for booking {booking['public_id']}.")
+        return {"booking": {key: value for key, value in updated.items() if key != "_id"} | {"id": updated["_id"]}, "amount_received": amount_due, "method": method}
+
     async def verify_end(self, booking_id: str, actor_role: Role, user_id: str, purpose: OtpPurpose, code: str) -> dict[str, Any]:
         if actor_role != Role.DRIVER or purpose != OtpPurpose.DRIVER_END:
             raise HTTPException(status_code=403, detail="Only the assigned driver can verify the customer completion OTP")
         booking = await self._assigned_booking(booking_id, user_id)
+        if booking["status"] not in {BookingStatus.DESTINATION_REACHED, BookingStatus.COMPLETION_OTP_PENDING}:
+            raise HTTPException(status_code=409, detail="Driver must request the completion OTP before completing the trip")
         otp = await self.repository.active_otp(booking_id, purpose.value)
         if not otp or otp["target_role"] != Role.CUSTOMER.value:
             raise HTTPException(status_code=404, detail="No customer completion OTP is active")
@@ -152,7 +181,13 @@ class TripService:
         return await self.complete(booking)
 
     async def complete(self, booking: dict[str, Any]) -> dict[str, Any]:
+        recalculated = await self._recalculate(booking)
+        if int(recalculated.get("balance_due", 0)) > 0:
+            raise HTTPException(status_code=409, detail=f"Final balance of ₹{recalculated['balance_due']} is still pending")
         updated = await self.repository.update_booking(booking["_id"], {"status": BookingStatus.TRIP_COMPLETED, "trip_completed_at": datetime.now(UTC), "version": booking.get("version", 1) + 1})
+        active_otp = await self.repository.active_otp(booking["_id"], OtpPurpose.DRIVER_END.value)
+        if active_otp:
+            await self.repository.consume_otp(active_otp["_id"], "CANCELLED")
         live_locations.remove(booking["_id"])
         completed = await self._recalculate(updated or booking)
         await self.repository.add_notification(booking["customer_id"], "TRIP_COMPLETED", "Trip completed", f"Booking {booking['public_id']} is complete. Final total: ₹{completed['total']}.")
@@ -169,8 +204,9 @@ class TripService:
         original_lines = [line for line in booking.get("line_items", []) if line.get("code") not in {"WAITING", "TRIP_EXTRA"}]
         quoted_total = int(booking.get("quoted_total", booking.get("paid_amount", booking.get("total", 0) - int(booking.get("waiting_charge", 0)) - int(booking.get("extra_total", 0))) or sum(int(line.get("amount", 0)) for line in original_lines)))
         paid_amount = int(booking.get("paid_amount", quoted_total if booking.get("payment_status") == "PAID" else 0))
+        driver_collected_amount = int(booking.get("driver_collected_amount", 0))
         final_total = int(booking.get("total", quoted_total + int(booking.get("waiting_charge", 0)) + extra_total))
-        payment_summary = {"quoted_total": quoted_total, "paid_amount": paid_amount, "additional_charges": max(0, final_total - quoted_total), "final_total": final_total, "amount_to_collect": max(0, final_total - paid_amount)}
+        payment_summary = {"quoted_total": quoted_total, "paid_amount": paid_amount, "driver_collected_amount": driver_collected_amount, "additional_charges": max(0, final_total - quoted_total), "final_total": final_total, "amount_to_collect": max(0, final_total - paid_amount - driver_collected_amount)}
         return {"booking": {key: value for key, value in booking.items() if key != "_id"} | {"id": booking["_id"]}, "driver": driver_contact, "driver_location": driver_location, "extras": [{key: value for key, value in item.items() if key != "_id"} | {"id": item["_id"]} for item in extras], "payment_summary": payment_summary}
 
     async def _recalculate(self, booking: dict[str, Any]) -> dict[str, Any]:
@@ -184,7 +220,9 @@ class TripService:
         if extra_total:
             line_items.append({"code": "TRIP_EXTRA", "label": "Trip extras", "amount": extra_total})
         base_total = int(booking.get("quoted_total", booking.get("paid_amount", booking.get("total", 0) - int(booking.get("waiting_charge", 0)) - int(booking.get("extra_total", 0))) or sum(int(line.get("amount", 0)) for line in original_lines)))
-        updated = await self.repository.update_booking(booking["_id"], {"quoted_total": base_total, "line_items": line_items, "extra_total": extra_total, "waiting_charge": waiting_charge, "total": base_total + waiting_charge + extra_total})
+        final_total = base_total + waiting_charge + extra_total
+        balance_due = max(0, final_total - int(booking.get("paid_amount", 0)) - int(booking.get("driver_collected_amount", 0)))
+        updated = await self.repository.update_booking(booking["_id"], {"quoted_total": base_total, "line_items": line_items, "extra_total": extra_total, "waiting_charge": waiting_charge, "total": final_total, "balance_due": balance_due})
         return {key: value for key, value in (updated or booking).items() if key != "_id"} | {"id": booking["_id"]}
 
     def _airport_waiting_charge(self, booking: dict[str, Any], verified_at: datetime) -> int:

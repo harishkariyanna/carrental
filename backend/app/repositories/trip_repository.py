@@ -32,8 +32,10 @@ class TripRepository:
         items = await self.store.find_many("trip_otps", {"booking_id": booking_id, "purpose": purpose, "consumed": False}, limit=20)
         return sorted(items, key=lambda item: str(item.get("created_at", "")), reverse=True)[0] if items else None
 
-    async def consume_otp(self, otp_id: str) -> None:
-        await self.store.update("trip_otps", otp_id, {"consumed": True, "consumed_at": utcnow()})
+    async def consume_otp(self, otp_id: str, status: str = "VERIFIED") -> None:
+        now = utcnow()
+        timestamp = "verified_at" if status == "VERIFIED" else "closed_at"
+        await self.store.update("trip_otps", otp_id, {"consumed": True, "status": status, timestamp: now})
 
     async def add_extra(self, document: dict[str, Any]) -> dict[str, Any]:
         return await self.store.insert("trip_extras", document)

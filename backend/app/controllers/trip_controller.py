@@ -1,10 +1,11 @@
+from typing import Literal
+
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from ..core.enums import ExtraChargeType, OtpPurpose, Role
-from ..dependencies import get_store, require_verified_driver
+from ..dependencies import get_store, require_active_roles, require_verified_driver
 from ..repositories.trip_repository import TripRepository
-from ..security import require_roles
 from ..services.trip_service import TripService
 from ..config import get_settings
 
@@ -33,6 +34,10 @@ class EndTripInput(BaseModel):
     longitude: float | None = Field(default=None, ge=-180, le=180)
 
 
+class BalanceCollectionInput(BaseModel):
+    method: Literal["CASH", "UPI"]
+
+
 def service(store):
     return TripService(TripRepository(store), get_settings())
 
@@ -53,7 +58,7 @@ async def start_waiting(booking_id: str, claims=Depends(require_verified_driver)
 
 
 @router.get("/{booking_id}/otp/{purpose}")
-async def show_otp(booking_id: str, purpose: OtpPurpose, claims=Depends(require_roles("CUSTOMER", "DRIVER")), store=Depends(get_store)):
+async def show_otp(booking_id: str, purpose: OtpPurpose, claims=Depends(require_active_roles("CUSTOMER", "DRIVER")), store=Depends(get_store)):
     return await service(store).otp_for_role(booking_id, purpose, Role(claims["role"]), claims["sub"])
 
 
@@ -72,11 +77,16 @@ async def request_end(booking_id: str, payload: EndTripInput, claims=Depends(req
     return await service(store).request_end(booking_id, Role.DRIVER, claims["sub"], payload.latitude, payload.longitude)
 
 
+@router.post("/{booking_id}/record-balance")
+async def record_balance(booking_id: str, payload: BalanceCollectionInput, claims=Depends(require_verified_driver), store=Depends(get_store)):
+    return await service(store).record_balance(booking_id, claims["sub"], payload.method)
+
+
 @router.post("/{booking_id}/verify-end/DRIVER_END")
 async def verify_end(booking_id: str, payload: OtpVerification, claims=Depends(require_verified_driver), store=Depends(get_store)):
     return await service(store).verify_end(booking_id, Role.DRIVER, claims["sub"], OtpPurpose.DRIVER_END, payload.code)
 
 
 @router.get("/{booking_id}")
-async def trip_view(booking_id: str, claims=Depends(require_roles("CUSTOMER", "DRIVER", "ADMIN")), store=Depends(get_store)):
+async def trip_view(booking_id: str, claims=Depends(require_active_roles("CUSTOMER", "DRIVER", "ADMIN")), store=Depends(get_store)):
     return await service(store).trip_view(booking_id, Role(claims["role"]), claims["sub"])

@@ -79,7 +79,7 @@ class Store:
         return (
             "users", "drivers", "vehicles", "quotes", "bookings", "payments",
             "notifications", "reviews", "trip_events", "audit_logs",
-            "support_requests", "vehicle_reservations", "payment_webhook_events",
+            "support_requests", "vehicle_reservations", "driver_reservations", "payment_webhook_events",
             "password_reset_otps", "pricing_rules", "coupons", "coupon_redemptions", "platform_settings",
             "saved_locations",
             "media_blobs", "trip_otps", "trip_extras", "email_outbox",
@@ -94,6 +94,9 @@ class Store:
         await self.db.vehicles.create_index("registration_number", unique=True, sparse=True)
         await self.db.vehicle_reservations.create_index("booking_id")
         await self.db.vehicle_reservations.create_index("expires_at", expireAfterSeconds=0)
+        await self.db.driver_reservations.create_index("booking_id")
+        await self.db.driver_reservations.create_index("driver_id")
+        await self.db.driver_reservations.create_index("expires_at", expireAfterSeconds=0)
         await self.db.payment_webhook_events.create_index("provider_event_id", unique=True)
         await self.db.password_reset_otps.create_index("expires_at", expireAfterSeconds=0)
         await self.db.coupons.create_index("code", unique=True)
@@ -102,6 +105,7 @@ class Store:
         await self.db.saved_locations.create_index("customer_id")
         await self.db.media_blobs.create_index([("entity_type", ASCENDING), ("entity_id", ASCENDING)])
         await self.db.trip_otps.create_index("expires_at", expireAfterSeconds=0)
+        await self.db.trip_otps.create_index([("booking_id", ASCENDING), ("purpose", ASCENDING), ("consumed", ASCENDING)])
         await self.db.trip_extras.create_index("booking_id")
         await self.db.email_outbox.create_index([("status", ASCENDING), ("created_at", ASCENDING)])
         await self.db.email_outbox.create_index([("user_id", ASCENDING), ("created_at", ASCENDING)])
@@ -181,7 +185,7 @@ class Store:
         await self._ensure_seed_user("customer-demo", "Harish Kumar", self.settings.seed_customer_email, "+919876543210", "CUSTOMER", self.settings.seed_customer_password.get_secret_value())
         await self._ensure_seed_user("driver-demo", "Raj Kumar", self.settings.seed_driver_email, "+919800000002", "DRIVER", self.settings.seed_driver_password.get_secret_value())
         if not await self.find_one("drivers", {"_id": "driver-profile-demo"}):
-            await self.insert("drivers", {"_id": "driver-profile-demo", "user_id": "driver-demo", "availability": "AVAILABLE", "verification_status": "VERIFIED", "documents_status": "APPROVED", "rating": 4.8, "earnings": 18400, "license_expiry": "2028-12-31"})
+            await self.insert("drivers", {"_id": "driver-profile-demo", "user_id": "driver-demo", "schedule_availability": "AVAILABLE", "online_status": "OFFLINE", "verification_status": "VERIFIED", "documents_status": "APPROVED", "rating": 4.8, "earnings": 18400, "license_expiry": "2028-12-31"})
         else:
             profile = await self.find_one("drivers", {"_id": "driver-profile-demo"})
             if profile and not profile.get("verification_status"):
@@ -215,7 +219,7 @@ class Store:
                 "version": 1,
             })
         if not await self.find_one("platform_settings", {"_id": "global"}):
-            await self.insert("platform_settings", {"_id": "global", "platform_name": "RideX", "support_email": self.settings.smtp_from_email, "support_phone": "+91 800 123 4567", "cancellation_hours": 2, "cancellation_fee_percent": 0, "google_review_url": "https://www.google.com/maps", "maintenance_mode": False, "upi_id": "ridex@upi", "airport_advance_type": "PERCENTAGE", "airport_advance_value": 25, "outstation_advance_type": "PERCENTAGE", "outstation_advance_value": 30})
+            await self.insert("platform_settings", {"_id": "global", "platform_name": "RideX", "support_email": self.settings.smtp_from_email, "support_phone": "+91 800 123 4567", "cancellation_hours": 2, "cancellation_fee_percent": 0, "google_review_url": "https://www.google.com/maps", "maintenance_mode": False, "upi_id": "ridex@upi", "standard_advance_type": "PERCENTAGE", "standard_advance_value": 25, "airport_advance_type": "PERCENTAGE", "airport_advance_value": 25, "outstation_advance_type": "PERCENTAGE", "outstation_advance_value": 30})
         if not await self.count("pricing_rules"):
             multipliers = {"NORMAL": 1, "AIRPORT": 1.25, "HOURLY": 1, "OUTSTATION": 1.9}
             for vehicle in await self.find_many("vehicles"):

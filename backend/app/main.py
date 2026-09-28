@@ -25,11 +25,12 @@ from .controllers.maps_controller import router as maps_router
 from .controllers.media_controller import router as media_router
 from .controllers.trip_controller import router as trip_router
 from .database import public, utcnow
-from .dependencies import require_verified_driver, settings, store
-from .schemas import BookingCreate, CouponInput, CustomerProfileUpdate, DriverAssignment, DriverCreate, DriverUpdate, LoginRequest, PlatformSettingsUpdate, PricingRuleInput, QuoteRequest, RegisterRequest, ReviewCreate, ReviewModeration, SavedLocationInput, TripTransition, UserUpdate, VehicleDriverAssignment, VehicleInput, VehicleUpdate
+from .dependencies import require_active_driver, require_verified_driver, settings, store
+from .schemas import BookingCreate, CouponInput, CustomerProfileUpdate, DriverAssignment, DriverCreate, DriverUpdate, LoginRequest, PlatformSettingsUpdate, PricingRuleInput, QuoteRequest, RegisterRequest, ReviewCreate, ReviewModeration, SavedLocationInput, ServiceType, TripTransition, UserUpdate, VehicleDriverAssignment, VehicleInput, VehicleUpdate
 from .security import create_session_token, hash_password, optional_session_claims, require_roles, session_claims, verify_access_token, verify_password
 from .services.map_service import MapService
 from .services.email_service import EmailDeliveryService, email_worker
+from .services.live_location_service import live_locations
 from .services.pricing_service import calculate_vehicle_quote, public_vehicle
 
 email_delivery = EmailDeliveryService(store, settings)
@@ -98,9 +99,97 @@ def reservation_slots(request_data: dict[str, Any]) -> list[str]:
     return [(start + timedelta(minutes=30 * offset)).astimezone(UTC).isoformat() for offset in range(hours * 2)]
 
 
+DRIVER_SCHEDULE_STATES = {"DRIVER_ASSIGNED", "DRIVER_ACCEPTED", "DRIVER_ON_THE_WAY", "DRIVER_ARRIVED", "TRIP_STARTED", "DESTINATION_REACHED", "COMPLETION_OTP_PENDING"}
+DRIVER_ACTIVE_STATES = {"DRIVER_ON_THE_WAY", "DRIVER_ARRIVED", "TRIP_STARTED", "DESTINATION_REACHED", "COMPLETION_OTP_PENDING"}
+
+
+def booking_schedule(booking: dict[str, Any]) -> tuple[datetime, datetime, list[str]]:
+    slots = reservation_slots(booking)
+    start = datetime.fromisoformat(booking["scheduled_at"].replace("Z", "+00:00"))
+    end = datetime.fromisoformat(slots[-1].replace("Z", "+00:00")) + timedelta(minutes=30)
+    return start, end, slots
+
+
+async def driver_assignment_eligibility(driver_id: str, booking: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+    driver = await store.find_one("users", {"_id": driver_id, "role": "DRIVER"})
+    profile = await store.find_one("drivers", {"user_id": driver_id})
+    if not driver or driver.get("status") != "ACTIVE":
+        return driver, profile, "Driver account is inactive"
+    if not profile or profile.get("verification_status") != "VERIFIED":
+        return driver, profile, "Driver is not approved"
+    if profile.get("schedule_availability", "AVAILABLE") != "AVAILABLE":
+        return driver, profile, "Driver is marked unavailable by admin"
+    requested_start, requested_end, _ = booking_schedule(booking)
+    for existing in await store.find_many("bookings", {"driver_id": driver_id}, limit=10_000):
+        if existing.get("_id") == booking.get("_id") or existing.get("status") not in DRIVER_SCHEDULE_STATES:
+            continue
+        if existing.get("status") in DRIVER_ACTIVE_STATES:
+            return driver, profile, f"Active trip {existing.get('public_id', existing['_id'])} is in progress"
+        existing_start, existing_end, _ = booking_schedule(existing)
+        if requested_start < existing_end and requested_end > existing_start:
+            return driver, profile, f"Overlaps {existing.get('public_id', existing['_id'])} from {existing_start.isoformat()} to {existing_end.isoformat()}"
+    return driver, profile, None
+
+
+async def claim_driver_schedule(driver_id: str, booking: dict[str, Any]) -> bool:
+    _, schedule_end, slots = booking_schedule(booking)
+    inserted_ids: list[str] = []
+    for slot in slots:
+        reservation_id = f"{driver_id}:{slot}"
+        existing = await store.find_one("driver_reservations", {"_id": reservation_id})
+        if existing:
+            if existing.get("booking_id") == booking["_id"]:
+                continue
+            for inserted_id in inserted_ids:
+                await store.delete_many("driver_reservations", {"_id": inserted_id})
+            return False
+        try:
+            await store.insert("driver_reservations", {"_id": reservation_id, "driver_id": driver_id, "booking_id": booking["_id"], "slot": slot, "expires_at": schedule_end + timedelta(days=1)})
+            inserted_ids.append(reservation_id)
+        except DuplicateKeyError:
+            winner = await store.find_one("driver_reservations", {"_id": reservation_id})
+            if winner and winner.get("booking_id") == booking["_id"]:
+                continue
+            for inserted_id in inserted_ids:
+                await store.delete_many("driver_reservations", {"_id": inserted_id})
+            return False
+    return True
+
+
 async def add_notification(user_id: str, event_type: str, title: str, message: str) -> None:
     await store.insert("notifications", {"user_id": user_id, "event_type": event_type, "title": title, "message": message, "read": False})
     await email_delivery.enqueue_for_user(user_id, f"RideX: {title}", message, event_type)
+
+
+async def assign_booking_driver(booking: dict[str, Any], driver_id: str, source: str, actor_id: str = "system") -> tuple[dict[str, Any] | None, str | None]:
+    driver, _, reason = await driver_assignment_eligibility(driver_id, booking)
+    if reason:
+        return None, reason
+    if not await claim_driver_schedule(driver_id, booking):
+        return None, "Driver schedule was just reserved by another booking"
+    previous_driver_id = booking.get("driver_id")
+    updated = await store.update("bookings", booking["_id"], {"driver_id": driver_id, "status": "DRIVER_ASSIGNED", "assignment_status": source, "assignment_reason": None, "version": booking.get("version", 1) + 1})
+    if not updated:
+        await store.delete_many("driver_reservations", {"booking_id": booking["_id"], "driver_id": driver_id})
+        return None, "Booking could not be updated"
+    if previous_driver_id and previous_driver_id != driver_id:
+        await store.delete_many("driver_reservations", {"booking_id": booking["_id"], "driver_id": previous_driver_id})
+        await add_notification(previous_driver_id, "DRIVER_REASSIGNED", "Trip reassigned", f"Trip {booking['public_id']} was reassigned to another driver.")
+    if previous_driver_id != driver_id:
+        await add_notification(driver_id, "DRIVER_ASSIGNED", "New trip assigned", f"Trip {booking['public_id']} is ready for review.")
+        await add_notification(booking["customer_id"], "DRIVER_ASSIGNED", "Driver assigned", f"{driver['name']} has been assigned to your ride.")
+    await store.insert("audit_logs", {"actor_user_id": actor_id, "action": source, "entity_type": "booking", "entity_id": booking["_id"], "metadata": {"driver_id": driver_id, "previous_driver_id": previous_driver_id}})
+    return updated, None
+
+
+async def auto_assign_vehicle_driver(booking: dict[str, Any]) -> dict[str, Any]:
+    default_profile = await store.find_one("drivers", {"assigned_vehicle_id": booking["vehicle_id"]})
+    if not default_profile:
+        return await store.update("bookings", booking["_id"], {"assignment_status": "AWAITING_ADMIN", "assignment_reason": "Vehicle has no default driver"}) or booking
+    updated, reason = await assign_booking_driver(booking, default_profile["user_id"], "AUTO_ASSIGNED")
+    if updated:
+        return updated
+    return await store.update("bookings", booking["_id"], {"assignment_status": "AWAITING_ADMIN", "assignment_reason": reason or "Default driver is unavailable"}) or booking
 
 
 async def audit_admin(admin_id: str, action: str, entity_type: str, entity_id: str, metadata: dict[str, Any] | None = None) -> None:
@@ -144,15 +233,22 @@ def day_key(value: Any) -> str:
     return utcnow().date().isoformat()
 
 
+def as_utc_datetime(value: datetime | str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else value
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
 async def enrich_booking(booking: dict[str, Any]) -> dict[str, Any]:
     customer = await store.find_one("users", {"_id": booking.get("customer_id")})
     driver = await store.find_one("users", {"_id": booking.get("driver_id")}) if booking.get("driver_id") else None
     driver_profile = await store.find_one("drivers", {"user_id": booking.get("driver_id")}) if booking.get("driver_id") else None
     vehicle = await store.find_one("vehicles", {"_id": booking.get("vehicle_id")})
-    driver_location = None
-    if driver_profile and booking.get("status") in {"DRIVER_ON_THE_WAY", "DRIVER_ARRIVED", "TRIP_STARTED"}:
-        driver_location = {"latitude": driver_profile.get("latitude"), "longitude": driver_profile.get("longitude"), "last_seen": driver_profile.get("last_seen"), "availability": driver_profile.get("availability")}
-    return {**(public(booking) or {}), "customer": public(customer), "driver": public(driver), "driver_location": driver_location, "vehicle": public(vehicle)}
+    default_profile = await store.find_one("drivers", {"assigned_vehicle_id": booking.get("vehicle_id")})
+    default_driver = await store.find_one("users", {"_id": default_profile.get("user_id")}) if default_profile else None
+    driver_location = live_locations.get(booking["_id"])
+    if not driver_location and driver_profile and booking.get("status") in {"DRIVER_ACCEPTED", "DRIVER_ON_THE_WAY", "DRIVER_ARRIVED", "TRIP_STARTED", "DESTINATION_REACHED", "COMPLETION_OTP_PENDING"}:
+        driver_location = {"latitude": driver_profile.get("latitude"), "longitude": driver_profile.get("longitude"), "last_seen": driver_profile.get("last_seen"), "online_status": driver_profile.get("online_status", "OFFLINE")}
+    return {**(public(booking) or {}), "customer": public(customer), "driver": public(driver), "default_driver": public(default_driver), "driver_location": driver_location, "vehicle": public(vehicle)}
 
 
 async def confirm_payment(payment: dict[str, Any], provider_payment_id: str) -> dict[str, Any]:
@@ -160,6 +256,8 @@ async def confirm_payment(payment: dict[str, Any], provider_payment_id: str) -> 
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
     if payment.get("status") == "PAID":
+        if not booking.get("driver_id") and booking.get("status") == "CONFIRMED":
+            return await auto_assign_vehicle_driver(booking)
         return booking
     if booking.get("coupon_id"):
         coupon = await store.find_one("coupons", {"_id": booking["coupon_id"]})
@@ -174,8 +272,10 @@ async def confirm_payment(payment: dict[str, Any], provider_payment_id: str) -> 
     paid_amount = int(booking.get("paid_amount", 0)) + int(payment["amount"])
     payment_status = "PAID" if paid_amount >= int(booking["total"]) else "ADVANCE_PAID"
     updated = await store.update("bookings", booking["_id"], {"status": "CONFIRMED", "payment_status": payment_status, "paid_amount": paid_amount, "balance_due": max(0, int(booking["total"]) - paid_amount), "version": booking.get("version", 1) + 1})
-    reservation_expiry = datetime.fromisoformat(booking["scheduled_at"]) + timedelta(hours=booking.get("package_hours") or 12, days=1)
+    _, scheduled_end, _ = booking_schedule(updated or booking)
+    reservation_expiry = scheduled_end + timedelta(days=1)
     await store.update_many("vehicle_reservations", {"booking_id": booking["_id"]}, {"status": "ACTIVE", "expires_at": reservation_expiry})
+    updated = await auto_assign_vehicle_driver(updated or booking)
     await add_notification(booking["customer_id"], "BOOKING_CONFIRMED", "Booking confirmed", f"Booking {booking['public_id']} is confirmed.")
     return updated or booking
 
@@ -188,9 +288,18 @@ async def payment_policy(booking: dict[str, Any]) -> tuple[int, str, dict[str, A
     elif service_type == "OUTSTATION":
         policy_type, value = platform.get("outstation_advance_type", "PERCENTAGE"), int(platform.get("outstation_advance_value", 30))
     else:
-        return int(booking["total"]), "FULL", platform
+        policy_type, value = platform.get("standard_advance_type", "PERCENTAGE"), int(platform.get("standard_advance_value", 25))
     amount = round(int(booking["total"]) * value / 100) if policy_type == "PERCENTAGE" else value
-    return max(1, min(int(booking["total"]), amount)), f"ADVANCE_{policy_type}", platform
+    amount = max(1, min(int(booking["total"]), amount))
+    return amount, "FULL" if amount >= int(booking["total"]) else f"ADVANCE_{policy_type}", platform
+
+
+@app.get(f"{settings.api_prefix}/payment-policy/preview")
+async def payment_policy_preview(service_type: str, total: int) -> dict[str, Any]:
+    if service_type not in {item.value for item in ServiceType} or total <= 0:
+        raise HTTPException(status_code=422, detail="Valid service type and total are required")
+    amount, payment_type, _ = await payment_policy({"service_type": service_type, "total": total})
+    return {"amount": amount, "remaining": max(0, total - amount), "booking_total": total, "payment_type": payment_type}
 
 
 def upi_payment_uri(upi_id: str, amount: int, reference: str) -> str:
@@ -200,8 +309,8 @@ def upi_payment_uri(upi_id: str, amount: int, reference: str) -> str:
 async def applicable_coupon(code: str, customer_id: str | None, booking_total: int) -> tuple[dict[str, Any], int]:
     coupon = await store.find_one("coupons", {"code": code.upper(), "status": "ACTIVE"})
     now = utcnow()
-    valid_from = datetime.fromisoformat(coupon["valid_from"].replace("Z", "+00:00")) if coupon and isinstance(coupon.get("valid_from"), str) else coupon.get("valid_from") if coupon else None
-    valid_to = datetime.fromisoformat(coupon["valid_to"].replace("Z", "+00:00")) if coupon and isinstance(coupon.get("valid_to"), str) else coupon.get("valid_to") if coupon else None
+    valid_from = as_utc_datetime(coupon["valid_from"]) if coupon and coupon.get("valid_from") else None
+    valid_to = as_utc_datetime(coupon["valid_to"]) if coupon and coupon.get("valid_to") else None
     if not coupon or not valid_from or not valid_to or valid_from > now or valid_to < now:
         raise HTTPException(status_code=422, detail="Coupon is invalid or expired")
     if coupon.get("scope", "PUBLIC") == "PERSONAL":
@@ -239,7 +348,7 @@ async def register(payload: RegisterRequest, response: Response) -> dict[str, st
     try:
         await store.insert("users", user)
         if payload.role == "DRIVER":
-            await store.insert("drivers", {"user_id": user["_id"], "availability": "OFFLINE", "verification_status": "PENDING", "license_number": payload.license_number, "license_expiry": payload.license_expiry, "documents_status": "INCOMPLETE", "rating": 0, "earnings": 0})
+            await store.insert("drivers", {"user_id": user["_id"], "schedule_availability": "AVAILABLE", "online_status": "OFFLINE", "verification_status": "PENDING", "license_number": payload.license_number, "license_expiry": payload.license_expiry, "documents_status": "INCOMPLETE", "rating": 0, "earnings": 0})
     except DuplicateKeyError as exc:
         raise HTTPException(status_code=409, detail="An account with this email already exists") from exc
     await add_notification(user["_id"], "ACCOUNT_CREATED", "Welcome to RideX" if payload.role == "CUSTOMER" else "Driver application started", "Your RideX account is ready." if payload.role == "CUSTOMER" else "Upload your licence, vehicle photos, and address proof to submit your driver application for review.")
@@ -283,7 +392,7 @@ async def customer_dashboard(customer: dict[str, str] = Depends(require_roles("C
     reviews = await store.find_many("reviews", {"customer_id": customer["sub"]}, limit=1000)
     locations = await store.find_many("saved_locations", {"customer_id": customer["sub"]}, limit=1000)
     upcoming_states = {"CONFIRMED", "DRIVER_ASSIGNED", "DRIVER_ACCEPTED"}
-    active_states = {"DRIVER_ON_THE_WAY", "DRIVER_ARRIVED", "TRIP_STARTED"}
+    active_states = {"DRIVER_ACCEPTED", "DRIVER_ON_THE_WAY", "DRIVER_ARRIVED", "TRIP_STARTED", "DESTINATION_REACHED", "COMPLETION_OTP_PENDING"}
     sorted_bookings = sorted(bookings, key=lambda item: str(item.get("scheduled_at", "")), reverse=True)
     active_booking = next((booking for booking in sorted_bookings if booking.get("status") in active_states), None)
     return {
@@ -404,19 +513,29 @@ async def create_quotes(payload: QuoteRequest, claims: dict[str, str] | None = D
         route = await MapService().route(payload.pickup_latitude, payload.pickup_longitude, payload.drop_latitude, payload.drop_longitude)
     distance_km = float(route["distance_m"]) / 1000 if route else None
     results = []
+    coupon_messages: set[str] = set()
     for vehicle in eligible:
         total, line_items, pricing = await quote_total(payload, vehicle, distance_km)
         pricing["estimated_duration_minutes"] = round(float(route["duration_s"]) / 60) if route else None
         coupon = None
         discount = 0
         if payload.coupon_code:
-            coupon, discount = await applicable_coupon(payload.coupon_code, claims.get("sub") if claims and claims.get("role") == "CUSTOMER" else None, total)
-            line_items.append({"code": "COUPON", "label": f"Coupon {coupon['code']}", "amount": -discount})
-            total -= discount
-            pricing["coupon"] = {"id": coupon["_id"], "code": coupon["code"], "discount": discount, "scope": coupon.get("scope", "PUBLIC")}
+            try:
+                coupon, discount = await applicable_coupon(payload.coupon_code, claims.get("sub") if claims and claims.get("role") == "CUSTOMER" else None, total)
+            except HTTPException as exc:
+                if exc.status_code == 422 and isinstance(exc.detail, str) and exc.detail.startswith("Coupon requires a minimum fare"):
+                    pricing["coupon_ineligible_reason"] = exc.detail
+                    coupon_messages.add(exc.detail)
+                else:
+                    raise
+            if coupon:
+                line_items.append({"code": "COUPON", "label": f"Coupon {coupon['code']}", "amount": -discount})
+                total -= discount
+                pricing["coupon"] = {"id": coupon["_id"], "code": coupon["code"], "discount": discount, "scope": coupon.get("scope", "PUBLIC")}
         quote = await store.insert("quotes", {"vehicle_id": vehicle["_id"], "request": payload.model_dump(mode="json"), "total": total, "currency": "INR", "line_items": line_items, "pricing": pricing, "coupon_id": coupon["_id"] if coupon else None, "coupon_code": coupon["code"] if coupon else None, "coupon_discount": discount, "expires_at": (utcnow() + timedelta(minutes=15)).isoformat()})
         results.append({"quote_id": quote["_id"], "vehicle": public_vehicle(vehicle, public), "total": total, "currency": "INR", "line_items": line_items, "pricing": pricing, "expires_at": quote["expires_at"]})
-    return {"results": results, "count": len(results), "route": {"distance_km": round(distance_km, 1), "estimated_duration_minutes": round(float(route["duration_s"]) / 60)} if route else None}
+    coupon_message = " ".join(sorted(coupon_messages)) if coupon_messages else None
+    return {"results": results, "count": len(results), "coupon_message": coupon_message, "route": {"distance_km": round(distance_km, 1), "estimated_duration_minutes": round(float(route["duration_s"]) / 60)} if route else None}
 
 
 @app.post(f"{settings.api_prefix}/bookings", status_code=201, dependencies=[Depends(verify_access_token)])
@@ -435,7 +554,8 @@ async def create_booking(payload: BookingCreate, user: dict[str, Any] = Depends(
     if not existing:
         existing = await store.find_one("bookings", {"customer_id": user["_id"], "vehicle_id": payload.vehicle_id, "scheduled_at": request_data["scheduled_at"], "status": "PENDING_PAYMENT", "payment_status": "PENDING"})
     if existing:
-        return public(existing) or {}
+        updated = await store.update("bookings", existing["_id"], {"quote_id": payload.quote_id, "coupon_id": quote.get("coupon_id"), "coupon_code": quote.get("coupon_code"), "coupon_discount": quote.get("coupon_discount", 0), "passenger_name": payload.passenger_name, "passenger_phone": payload.passenger_phone, "special_instructions": payload.special_instructions, "quoted_total": quote["total"], "total": quote["total"], "currency": quote["currency"], "line_items": quote["line_items"], "pricing": quote.get("pricing", {}), "version": existing.get("version", 1) + 1})
+        return public(updated or existing) or {}
     booking_id = uuid4().hex
     try:
         for slot in reservation_slots(request_data):
@@ -444,7 +564,8 @@ async def create_booking(payload: BookingCreate, user: dict[str, Any] = Depends(
         await store.delete_many("vehicle_reservations", {"booking_id": booking_id})
         raise HTTPException(status_code=409, detail="This vehicle was just reserved. Please choose another car.") from exc
     tariff = quote.get("pricing", {}).get("vehicle_tariff", {})
-    booking = await store.insert("bookings", {"_id": booking_id, "quote_id": payload.quote_id, "public_id": f"RX{utcnow():%Y%m%d}{uuid4().hex[:5].upper()}", "customer_id": user["_id"], "vehicle_id": payload.vehicle_id, "driver_id": None, "service_type": request_data["service_type"], "pickup": request_data["pickup"], "destination": request_data.get("destination") or request_data["pickup"], "pickup_latitude": request_data.get("pickup_latitude"), "pickup_longitude": request_data.get("pickup_longitude"), "drop_latitude": request_data.get("drop_latitude"), "drop_longitude": request_data.get("drop_longitude"), "scheduled_at": request_data["scheduled_at"], "airport_direction": request_data.get("airport_direction"), "airport_pickup_at": request_data.get("airport_pickup_at"), "airport_grace_minutes": 30, "airport_waiting_rate": 150, "waiting_grace_minutes": tariff.get("local_waiting_grace_minutes", 15), "waiting_rate_per_minute": tariff.get("local_waiting_rate_per_minute", 5), "flight_number": request_data.get("flight_number"), "passengers": request_data["passengers"], "luggage": request_data["luggage"], "package_hours": request_data.get("package_hours"), "round_trip": request_data.get("round_trip", False), "ac_required": request_data.get("ac_required", True), "coupon_id": quote.get("coupon_id"), "coupon_code": quote.get("coupon_code"), "coupon_discount": quote.get("coupon_discount", 0), "passenger_name": payload.passenger_name, "passenger_phone": payload.passenger_phone, "special_instructions": payload.special_instructions, "status": "PENDING_PAYMENT", "payment_status": "PENDING", "quoted_total": quote["total"], "total": quote["total"], "currency": quote["currency"], "line_items": quote["line_items"], "pricing": quote.get("pricing", {}), "version": 1})
+    _, scheduled_end, _ = booking_schedule(request_data)
+    booking = await store.insert("bookings", {"_id": booking_id, "quote_id": payload.quote_id, "public_id": f"RX{utcnow():%Y%m%d}{uuid4().hex[:5].upper()}", "customer_id": user["_id"], "vehicle_id": payload.vehicle_id, "driver_id": None, "service_type": request_data["service_type"], "pickup": request_data["pickup"], "destination": request_data.get("destination") or request_data["pickup"], "pickup_latitude": request_data.get("pickup_latitude"), "pickup_longitude": request_data.get("pickup_longitude"), "drop_latitude": request_data.get("drop_latitude"), "drop_longitude": request_data.get("drop_longitude"), "scheduled_at": request_data["scheduled_at"], "scheduled_end_at": scheduled_end.isoformat(), "return_at": request_data.get("return_at"), "airport_direction": request_data.get("airport_direction"), "airport_pickup_at": request_data.get("airport_pickup_at"), "airport_grace_minutes": 30, "airport_waiting_rate": 150, "waiting_grace_minutes": tariff.get("local_waiting_grace_minutes", 15), "waiting_rate_per_minute": tariff.get("local_waiting_rate_per_minute", 5), "flight_number": request_data.get("flight_number"), "passengers": request_data["passengers"], "luggage": request_data["luggage"], "package_hours": request_data.get("package_hours"), "round_trip": request_data.get("round_trip", False), "ac_required": request_data.get("ac_required", True), "coupon_id": quote.get("coupon_id"), "coupon_code": quote.get("coupon_code"), "coupon_discount": quote.get("coupon_discount", 0), "passenger_name": payload.passenger_name, "passenger_phone": payload.passenger_phone, "special_instructions": payload.special_instructions, "status": "PENDING_PAYMENT", "payment_status": "PENDING", "assignment_status": "PENDING_PAYMENT", "quoted_total": quote["total"], "total": quote["total"], "currency": quote["currency"], "line_items": quote["line_items"], "pricing": quote.get("pricing", {}), "version": 1})
     return public(booking) or {}
 
 
@@ -465,11 +586,12 @@ async def cancel_booking(booking_id: str, user: dict[str, Any] = Depends(current
         raise HTTPException(status_code=404, detail="Booking not found")
     if user["role"] not in {"CUSTOMER", "ADMIN"}:
         raise HTTPException(status_code=403, detail="Insufficient permission")
-    if booking["status"] in {"TRIP_STARTED", "TRIP_COMPLETED", "CANCELLED", "REFUNDED"}:
+    if booking["status"] in {"TRIP_STARTED", "DESTINATION_REACHED", "COMPLETION_OTP_PENDING", "TRIP_COMPLETED", "CANCELLED", "REFUND_PENDING", "REFUNDED"}:
         raise HTTPException(status_code=409, detail="Booking can no longer be cancelled")
     paid = booking.get("payment_status") in {"PAID", "ADVANCE_PAID"}
     updated = await store.update("bookings", booking_id, {"status": "REFUND_PENDING" if paid else "CANCELLED", "payment_status": "REFUND_PENDING" if paid else booking.get("payment_status"), "version": booking.get("version", 1) + 1})
     await store.delete_many("vehicle_reservations", {"booking_id": booking_id})
+    await store.delete_many("driver_reservations", {"booking_id": booking_id})
     await add_notification(booking["customer_id"], "BOOKING_CANCELLED", "Booking cancelled", f"Booking {booking['public_id']} was cancelled." + (" Your refund is being processed." if paid else ""))
     return public(updated) or {}
 
@@ -498,10 +620,11 @@ async def payment_order(booking_id: str, user: dict[str, Any] = Depends(current_
     if existing:
         if existing.get("status") == "PAID":
             return {**(public(existing) or {}), "qr_url": None}
-        if not existing.get("upi_uri") and existing.get("status") != "PAID":
-            amount, payment_type, platform = await payment_policy(booking)
+        amount, payment_type, platform = await payment_policy(booking)
+        upi_id = platform.get("upi_id", "ridex@upi")
+        stale_order = not existing.get("upi_uri") or int(existing.get("amount", 0)) != amount or int(existing.get("booking_total", 0)) != int(booking["total"]) or existing.get("payment_type") != payment_type or existing.get("upi_id") != upi_id
+        if stale_order:
             order_id = f"ridex_{uuid4().hex[:16]}"
-            upi_id = platform.get("upi_id", "ridex@upi")
             existing = await store.update("payments", existing["_id"], {"provider_order_id": order_id, "amount": amount, "booking_total": booking["total"], "currency": booking["currency"], "status": "CREATED", "method": "UPI_QR", "payment_type": payment_type, "upi_id": upi_id, "upi_uri": upi_payment_uri(upi_id, amount, order_id), "demo": test_payments_enabled}) or existing
         return {**(public(existing) or {}), "demo": test_payments_enabled, "qr_url": f"/payments/{existing['_id']}/qr"}
     amount, payment_type, platform = await payment_policy(booking)
@@ -684,10 +807,10 @@ async def admin_dashboard(_: dict[str, str] = Depends(require_roles("ADMIN"))) -
         "customers": sum(user["role"] == "CUSTOMER" for user in users),
         "drivers": sum(user["role"] == "DRIVER" for user in users),
         "vehicles": len(vehicles_list),
-        "active_trips": sum(booking["status"] in {"DRIVER_ON_THE_WAY", "DRIVER_ARRIVED", "TRIP_STARTED"} for booking in bookings),
+        "active_trips": sum(booking["status"] in {"DRIVER_ACCEPTED", "DRIVER_ON_THE_WAY", "DRIVER_ARRIVED", "TRIP_STARTED", "DESTINATION_REACHED", "COMPLETION_OTP_PENDING"} for booking in bookings),
         "pending_payments": sum(booking.get("payment_status") in {"PENDING", "PROCESSING"} for booking in bookings),
         "cancelled_bookings": sum(booking["status"] in {"CANCELLED", "REFUND_PENDING", "REFUNDED"} for booking in bookings),
-        "active_drivers": sum(profile.get("availability") == "AVAILABLE" for profile in driver_profiles),
+        "active_drivers": sum(profile.get("schedule_availability", "AVAILABLE") == "AVAILABLE" for profile in driver_profiles),
         "booking_trends": [{"date": day, "count": booking_counts[day]} for day in days],
         "revenue_trends": [{"date": day, "amount": revenue_counts[day]} for day in days],
         "service_breakdown": [{"service": key, "count": value} for key, value in service_counts.items()],
@@ -730,7 +853,7 @@ async def admin_create_driver(payload: DriverCreate, admin: dict[str, str] = Dep
         raise HTTPException(status_code=409, detail="Email already exists")
     password_digest, password_salt = hash_password(payload.password)
     user = await store.insert("users", {"name": payload.name, "email": payload.email.lower(), "phone": payload.phone, "role": "DRIVER", "status": "ACTIVE", "password_hash": password_digest, "password_salt": password_salt})
-    profile = await store.insert("drivers", {"user_id": user["_id"], "availability": "OFFLINE", "verification_status": "PENDING", "license_number": payload.license_number, "license_expiry": payload.license_expiry, "rating": 0, "earnings": 0})
+    profile = await store.insert("drivers", {"user_id": user["_id"], "schedule_availability": "AVAILABLE", "online_status": "OFFLINE", "verification_status": "PENDING", "license_number": payload.license_number, "license_expiry": payload.license_expiry, "rating": 0, "earnings": 0})
     await audit_admin(admin["sub"], "DRIVER_CREATED", "driver", user["_id"])
     return {**(public(user) or {}), "profile": public(profile)}
 
@@ -794,6 +917,11 @@ async def admin_payments(_: dict[str, str] = Depends(require_roles("ADMIN"))) ->
             "booking_public_id": booking.get("public_id") if booking else None,
             "customer_name": customer.get("name") if customer else None,
             "service_type": booking.get("service_type") if booking else None,
+            "booking_total": booking.get("total", payment.get("booking_total", 0)) if booking else payment.get("booking_total", 0),
+            "paid_amount": booking.get("paid_amount", 0) if booking else 0,
+            "driver_collected_amount": booking.get("driver_collected_amount", 0) if booking else 0,
+            "balance_due": booking.get("balance_due", payment.get("booking_total", 0)) if booking else payment.get("booking_total", 0),
+            "balance_payment_method": booking.get("balance_payment_method") if booking else None,
         })
     return result
 
@@ -831,7 +959,7 @@ async def assign_vehicle_driver(vehicle_id: str, payload: VehicleDriverAssignmen
     vehicle = await store.find_one("vehicles", {"_id": vehicle_id})
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
-    active_states = ["DRIVER_ASSIGNED", "DRIVER_ACCEPTED", "DRIVER_ON_THE_WAY", "DRIVER_ARRIVED", "TRIP_STARTED"]
+    active_states = ["DRIVER_ASSIGNED", "DRIVER_ACCEPTED", "DRIVER_ON_THE_WAY", "DRIVER_ARRIVED", "TRIP_STARTED", "DESTINATION_REACHED", "COMPLETION_OTP_PENDING"]
     current_profile = await store.find_one("drivers", {"assigned_vehicle_id": vehicle_id})
     if current_profile and current_profile.get("user_id") != payload.driver_id:
         active_trip = await store.find_one("bookings", {"driver_id": current_profile["user_id"], "status": {"$in": active_states}})
@@ -857,7 +985,7 @@ async def admin_delete_vehicle(vehicle_id: str, admin: dict[str, str] = Depends(
     vehicle = await store.find_one("vehicles", {"_id": vehicle_id})
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
-    active = await store.find_one("bookings", {"vehicle_id": vehicle_id, "status": {"$in": ["PENDING_PAYMENT", "CONFIRMED", "DRIVER_ASSIGNED", "DRIVER_ACCEPTED", "DRIVER_ON_THE_WAY", "DRIVER_ARRIVED", "TRIP_STARTED"]}})
+    active = await store.find_one("bookings", {"vehicle_id": vehicle_id, "status": {"$in": ["PENDING_PAYMENT", "CONFIRMED", "DRIVER_ASSIGNED", "DRIVER_ACCEPTED", "DRIVER_ON_THE_WAY", "DRIVER_ARRIVED", "TRIP_STARTED", "DESTINATION_REACHED", "COMPLETION_OTP_PENDING"]}})
     if active:
         raise HTTPException(status_code=409, detail="Vehicle has an active or upcoming booking and cannot be deleted")
     await store.update("vehicles", vehicle_id, {"status": "INACTIVE", "archived_at": utcnow()})
@@ -898,8 +1026,8 @@ async def public_coupons() -> list[dict[str, Any]]:
     coupons = await store.find_many("coupons", {"scope": "PUBLIC", "status": "ACTIVE"}, limit=100)
     result = []
     for item in coupons:
-        valid_from = datetime.fromisoformat(item["valid_from"].replace("Z", "+00:00")) if isinstance(item.get("valid_from"), str) else item.get("valid_from")
-        valid_to = datetime.fromisoformat(item["valid_to"].replace("Z", "+00:00")) if isinstance(item.get("valid_to"), str) else item.get("valid_to")
+        valid_from = as_utc_datetime(item["valid_from"]) if item.get("valid_from") else None
+        valid_to = as_utc_datetime(item["valid_to"]) if item.get("valid_to") else None
         if valid_from and valid_to and valid_from <= now <= valid_to and item.get("used_count", 0) < item.get("usage_limit", 1):
             result.append({"code": item["code"], "discount_type": item["discount_type"], "value": item["value"], "minimum_booking": item["minimum_booking"], "maximum_discount": item["maximum_discount"], "valid_to": item["valid_to"]})
     return result
@@ -1039,8 +1167,8 @@ async def admin_reports_summary(_: dict[str, str] = Depends(require_roles("ADMIN
 async def admin_get_settings(_: dict[str, str] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
     current = await store.find_one("platform_settings", {"_id": "global"})
     if not current:
-        current = await store.insert("platform_settings", {"_id": "global", "platform_name": "RideX", "support_email": settings.smtp_from_email, "support_phone": "+91 800 123 4567", "cancellation_hours": 2, "cancellation_fee_percent": 0, "google_review_url": "https://www.google.com/maps", "maintenance_mode": False, "upi_id": "ridex@upi", "airport_advance_type": "PERCENTAGE", "airport_advance_value": 25, "outstation_advance_type": "PERCENTAGE", "outstation_advance_value": 30})
-    defaults = {"upi_id": "ridex@upi", "airport_advance_type": "PERCENTAGE", "airport_advance_value": 25, "outstation_advance_type": "PERCENTAGE", "outstation_advance_value": 30}
+        current = await store.insert("platform_settings", {"_id": "global", "platform_name": "RideX", "support_email": settings.smtp_from_email, "support_phone": "+91 800 123 4567", "cancellation_hours": 2, "cancellation_fee_percent": 0, "google_review_url": "https://www.google.com/maps", "maintenance_mode": False, "upi_id": "ridex@upi", "standard_advance_type": "PERCENTAGE", "standard_advance_value": 25, "airport_advance_type": "PERCENTAGE", "airport_advance_value": 25, "outstation_advance_type": "PERCENTAGE", "outstation_advance_value": 30})
+    defaults = {"upi_id": "ridex@upi", "standard_advance_type": "PERCENTAGE", "standard_advance_value": 25, "airport_advance_type": "PERCENTAGE", "airport_advance_value": 25, "outstation_advance_type": "PERCENTAGE", "outstation_advance_value": 30}
     return {**defaults, **(public(current) or {}), "database": "mongodb-atlas" if not settings.demo_mode else "memory-demo", "email_configured": bool(settings.smtp_host and settings.smtp_password), "payments_configured": bool((current or {}).get("upi_id") or settings.razorpay_key_id)}
 
 
@@ -1102,28 +1230,37 @@ async def admin_cleanup_database_collection(collection: str, admin: dict[str, st
 @app.post(f"{settings.api_prefix}/admin/bookings/{{booking_id}}/assign-driver", dependencies=[Depends(verify_access_token)])
 async def assign_driver(booking_id: str, payload: DriverAssignment, admin: dict[str, str] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
     booking = await store.find_one("bookings", {"_id": booking_id})
-    driver = await store.find_one("users", {"_id": payload.driver_id, "role": "DRIVER"})
-    if not booking or not driver:
-        raise HTTPException(status_code=404, detail="Booking or driver not found")
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
     if booking["payment_status"] not in {"PAID", "ADVANCE_PAID"}:
         raise HTTPException(status_code=422, detail="Driver can only be assigned after payment")
-    driver_profile = await store.find_one("drivers", {"user_id": payload.driver_id})
-    if driver.get("status") != "ACTIVE" or not driver_profile or driver_profile.get("verification_status") != "VERIFIED":
-        raise HTTPException(status_code=409, detail="Driver must be approved before assignment")
-    updated = await store.update("bookings", booking_id, {"driver_id": payload.driver_id, "status": "DRIVER_ASSIGNED", "version": booking.get("version", 1) + 1})
-    await add_notification(payload.driver_id, "DRIVER_ASSIGNED", "New trip assigned", f"Trip {booking['public_id']} is ready for review.")
-    await add_notification(booking["customer_id"], "DRIVER_ASSIGNED", "Driver assigned", f"{driver['name']} has been assigned to your ride.")
-    await store.insert("audit_logs", {"actor_user_id": admin["sub"], "action": "DRIVER_ASSIGNED", "entity_id": booking_id})
-    return public(updated) or {}
+    if booking["status"] not in {"CONFIRMED", "DRIVER_ASSIGNED", "DRIVER_ACCEPTED"}:
+        raise HTTPException(status_code=409, detail="Driver can no longer be changed for this booking")
+    updated, reason = await assign_booking_driver(booking, payload.driver_id, "ADMIN_ASSIGNED", admin["sub"])
+    if not updated:
+        raise HTTPException(status_code=409, detail=reason or "Driver is unavailable")
+    return await enrich_booking(updated)
+
+
+@app.get(f"{settings.api_prefix}/admin/bookings/{{booking_id}}/available-drivers")
+async def available_booking_drivers(booking_id: str, _: dict[str, str] = Depends(require_roles("ADMIN"))) -> list[dict[str, Any]]:
+    booking = await store.find_one("bookings", {"_id": booking_id})
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    result = []
+    for user in await store.find_many("users", {"role": "DRIVER"}, limit=1000):
+        _, profile, reason = await driver_assignment_eligibility(user["_id"], booking)
+        result.append({**(public(user) or {}), "profile": public(profile), "available": reason is None, "unavailable_reason": reason})
+    return result
 
 
 @app.get(f"{settings.api_prefix}/driver/dashboard")
-async def driver_dashboard(driver: dict[str, str] = Depends(require_roles("DRIVER"))) -> dict[str, Any]:
+async def driver_dashboard(driver: dict[str, str] = Depends(require_active_driver)) -> dict[str, Any]:
     trips = await store.find_many("bookings", {"driver_id": driver["sub"]})
     profile = await store.find_one("drivers", {"user_id": driver["sub"]})
     user = await store.find_one("users", {"_id": driver["sub"]})
     completed_trips = [trip for trip in trips if trip["status"] == "TRIP_COMPLETED"]
-    return {"driver": public(user), "today": len(trips) if profile and profile.get("verification_status") == "VERIFIED" else 0, "upcoming": sum(t["status"] in {"DRIVER_ASSIGNED", "DRIVER_ACCEPTED"} for t in trips) if profile and profile.get("verification_status") == "VERIFIED" else 0, "completed": len(completed_trips), "availability": profile.get("availability", "OFFLINE") if profile else "OFFLINE", "earnings": sum(int(trip.get("total", 0)) for trip in completed_trips), "latitude": profile.get("latitude") if profile else None, "longitude": profile.get("longitude") if profile else None, "last_seen": profile.get("last_seen") if profile else None, "verification_status": profile.get("verification_status", "PENDING") if profile else "PENDING", "documents_status": profile.get("documents_status", "INCOMPLETE") if profile else "INCOMPLETE"}
+    return {"driver": public(user), "today": len(trips) if profile and profile.get("verification_status") == "VERIFIED" else 0, "upcoming": sum(t["status"] in {"DRIVER_ASSIGNED", "DRIVER_ACCEPTED"} for t in trips) if profile and profile.get("verification_status") == "VERIFIED" else 0, "completed": len(completed_trips), "online_status": profile.get("online_status", "OFFLINE") if profile else "OFFLINE", "schedule_availability": profile.get("schedule_availability", "AVAILABLE") if profile else "UNAVAILABLE", "earnings": sum(int(trip.get("total", 0)) for trip in completed_trips), "latitude": profile.get("latitude") if profile else None, "longitude": profile.get("longitude") if profile else None, "last_seen": profile.get("last_seen") if profile else None, "verification_status": profile.get("verification_status", "PENDING") if profile else "PENDING", "documents_status": profile.get("documents_status", "INCOMPLETE") if profile else "INCOMPLETE"}
 
 
 @app.get(f"{settings.api_prefix}/driver/trips")
@@ -1133,14 +1270,14 @@ async def driver_trips(driver: dict[str, str] = Depends(require_verified_driver)
 
 @app.patch(f"{settings.api_prefix}/driver/availability", dependencies=[Depends(verify_access_token)])
 async def driver_availability(payload: dict[str, str], driver: dict[str, str] = Depends(require_verified_driver)) -> dict[str, Any]:
-    availability = payload.get("availability")
-    if availability not in {"AVAILABLE", "OFFLINE"}:
-        raise HTTPException(status_code=422, detail="Availability must be AVAILABLE or OFFLINE")
+    online_status = payload.get("online_status") or ("ONLINE" if payload.get("availability") == "AVAILABLE" else payload.get("availability"))
+    if online_status not in {"ONLINE", "OFFLINE"}:
+        raise HTTPException(status_code=422, detail="Online status must be ONLINE or OFFLINE")
     profile = await store.find_one("drivers", {"user_id": driver["sub"]})
     if not profile:
         raise HTTPException(status_code=404, detail="Driver profile not found")
-    changes: dict[str, Any] = {"availability": availability, "last_seen": utcnow()}
-    if availability == "AVAILABLE":
+    changes: dict[str, Any] = {"online_status": online_status, "last_seen": utcnow()}
+    if online_status == "ONLINE":
         try:
             changes["latitude"] = float(payload["latitude"])
             changes["longitude"] = float(payload["longitude"])

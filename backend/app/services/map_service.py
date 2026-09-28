@@ -16,6 +16,13 @@ class MapService:
                 raise HTTPException(status_code=503, detail="Location search is temporarily unavailable")
             return [{"label": item["display_name"], "latitude": float(item["lat"]), "longitude": float(item["lon"])} for item in response.json()]
 
+    async def reverse(self, latitude: float, longitude: float) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=10, headers=self.headers) as client:
+            response = await client.get("https://nominatim.openstreetmap.org/reverse", params={"lat": latitude, "lon": longitude, "format": "jsonv2", "zoom": 18})
+            if response.is_error or not response.json().get("display_name"):
+                raise HTTPException(status_code=503, detail="Address lookup is temporarily unavailable")
+            return {"label": response.json()["display_name"], "latitude": latitude, "longitude": longitude}
+
     async def route(self, pickup_lat: float, pickup_lng: float, drop_lat: float, drop_lng: float) -> dict[str, Any]:
         url = f"https://router.project-osrm.org/route/v1/driving/{pickup_lng},{pickup_lat};{drop_lng},{drop_lat}"
         async with httpx.AsyncClient(timeout=12) as client:

@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { CarFront, Check, Clock3, MessageCircle, Navigation, Phone, ShieldCheck, UserRound, X } from 'lucide-react'
+import { CarFront, Check, Clock3, MessageCircle, Navigation, Phone, ShieldCheck, UserRound } from 'lucide-react'
 import { api, type Booking, indiaTime, money, whatsappUrl } from '../../../api'
 import { RouteMap } from '../../../shared/maps/RouteMap'
 
@@ -17,14 +17,23 @@ const statusSteps = [
   { status: 'DRIVER_ON_THE_WAY', label: 'On the way' },
   { status: 'DRIVER_ARRIVED', label: 'Arrived' },
   { status: 'TRIP_STARTED', label: 'In progress' },
+  { status: 'DESTINATION_REACHED', label: 'Destination' },
+  { status: 'COMPLETION_OTP_PENDING', label: 'Completion' },
 ]
+
+function locationFreshness(lastSeen?: string) {
+  if (!lastSeen) return 'Driver location temporarily unavailable'
+  const seconds = Math.max(0, Math.floor((Date.now() - new Date(lastSeen).getTime()) / 1000))
+  if (seconds < 10) return 'Location updated just now'
+  if (seconds < 60) return `Location last updated ${seconds} seconds ago`
+  return `Location last updated ${Math.floor(seconds / 60)} minutes ago`
+}
 
 export function CustomerLiveTripPage() {
   const [trip, setTrip] = useState<TripView | null>(null)
   const [otp, setOtp] = useState('')
-  const [completionOtpOpen, setCompletionOtpOpen] = useState(false)
+  const [otpExpiresAt, setOtpExpiresAt] = useState('')
   const [estimate, setEstimate] = useState<RouteEstimate | null>(null)
-  const lastCompletionOtp = useRef('')
 
   useEffect(() => {
     let cancelled = false
@@ -35,12 +44,10 @@ export function CustomerLiveTripPage() {
         return
       }
       const view = await api<TripView>(`/trip-operations/${dashboard.active_booking.id}`)
-      const purpose = view.booking.status === 'DRIVER_ARRIVED' ? 'START' : view.booking.status === 'TRIP_STARTED' ? 'DRIVER_END' : null
-      const code = purpose ? await api<{ code: string }>(`/trip-operations/${view.booking.id}/otp/${purpose}`).then((value) => value.code).catch(() => '') : ''
+      const purpose = view.booking.status === 'DRIVER_ARRIVED' ? 'START' : ['DESTINATION_REACHED', 'COMPLETION_OTP_PENDING'].includes(view.booking.status) ? 'DRIVER_END' : null
+      const activeOtp = purpose ? await api<{ code: string; expires_at: string }>(`/trip-operations/${view.booking.id}/otp/${purpose}`).catch(() => null) : null
       if (!cancelled) {
-        setTrip(view); setOtp(code)
-        if (purpose === 'DRIVER_END' && code && code !== lastCompletionOtp.current) { lastCompletionOtp.current = code; setCompletionOtpOpen(true) }
-        if (!code) lastCompletionOtp.current = ''
+        setTrip(view); setOtp(activeOtp?.code ?? ''); setOtpExpiresAt(activeOtp?.expires_at ?? '')
       }
     }
     const first = window.setTimeout(() => void refresh(), 0)
@@ -51,8 +58,9 @@ export function CustomerLiveTripPage() {
   const bookingStatus = trip?.booking.status
   const driverLatitude = trip?.driver_location?.latitude
   const driverLongitude = trip?.driver_location?.longitude
-  const targetLatitude = bookingStatus === 'TRIP_STARTED' ? trip?.booking.drop_latitude : trip?.booking.pickup_latitude
-  const targetLongitude = bookingStatus === 'TRIP_STARTED' ? trip?.booking.drop_longitude : trip?.booking.pickup_longitude
+  const headingToDestination = ['TRIP_STARTED', 'DESTINATION_REACHED', 'COMPLETION_OTP_PENDING'].includes(bookingStatus ?? '')
+  const targetLatitude = headingToDestination ? trip?.booking.drop_latitude : trip?.booking.pickup_latitude
+  const targetLongitude = headingToDestination ? trip?.booking.drop_longitude : trip?.booking.pickup_longitude
   useEffect(() => {
     if (driverLatitude == null || driverLongitude == null || targetLatitude == null || targetLongitude == null) return
     const params = new URLSearchParams({ pickup_lat: String(driverLatitude), pickup_lng: String(driverLongitude), drop_lat: String(targetLatitude), drop_lng: String(targetLongitude) })
@@ -74,7 +82,9 @@ export function CustomerLiveTripPage() {
     DRIVER_ACCEPTED: 'Your driver accepted the trip and is preparing to navigate.',
     DRIVER_ON_THE_WAY: `Your driver is on the way${estimate ? ` · ${Math.max(1, Math.ceil(estimate.duration_s / 60))} min · ${distanceLabel}` : ''}.`,
     DRIVER_ARRIVED: 'Your driver has arrived within 200 metres of the pickup location.',
-    TRIP_STARTED: `Your trip is in progress${estimate ? ` · destination ETA ${Math.max(1, Math.ceil(estimate.duration_s / 60))} min` : ''}.`,
+    TRIP_STARTED: `Trip started. Please sit back and enjoy the ride${estimate ? ` · destination ETA ${Math.max(1, Math.ceil(estimate.duration_s / 60))} min` : ''}.`,
+    DESTINATION_REACHED: 'You have reached the destination. Share the completion OTP when you are ready to finish the trip.',
+    COMPLETION_OTP_PENDING: 'Your driver requested trip completion. Share the OTP only when you are ready to end the ride.',
   }
 
   return <main className="role-page">
@@ -88,14 +98,13 @@ export function CustomerLiveTripPage() {
         <h2>Trip details</h2>
         <div className="trip-fact"><UserRound/><span>{trip.driver?.name ?? 'Driver assigned'}</span></div>
         {trip.driver?.phone && <div className="contact-row"><a className="button secondary compact" href={`tel:${trip.driver.phone}`}><Phone/> Call</a><a className="button secondary compact" target="_blank" rel="noreferrer" href={whatsappUrl(trip.driver.phone, `Hello ${trip.driver.name ?? 'Driver'}, I am your RideX customer for booking ${booking.public_id}.`)}><MessageCircle/> WhatsApp</a></div>}
-        <div className="trip-fact"><Clock3/><span>{trip.driver_location?.last_seen ? `Updated ${indiaTime(trip.driver_location.last_seen)}` : 'Waiting for location'}</span></div>
-        {otp && booking.status === 'DRIVER_ARRIVED' && <div className="otp-card"><ShieldCheck/><div><small>TRIP START OTP</small><strong>{otp}</strong><p>Share this only with your assigned driver.</p></div></div>}
-        {otp && booking.status === 'TRIP_STARTED' && <button className="button secondary wide" onClick={() => setCompletionOtpOpen(true)}><ShieldCheck/> Show Completion OTP</button>}
+        <div className="trip-fact"><Clock3/><span>{locationFreshness(trip.driver_location?.last_seen)}</span></div>
+        {otp && booking.status === 'DRIVER_ARRIVED' && <div className="otp-card"><ShieldCheck/><div><small>TRIP START OTP</small><strong>{otp}</strong><p>Share this only with your assigned driver when you are ready to start.</p><span>Active{otpExpiresAt ? ` · expires ${indiaTime(otpExpiresAt)}` : ''}</span></div></div>}
+        {otp && ['DESTINATION_REACHED', 'COMPLETION_OTP_PENDING'].includes(booking.status) && <div className="otp-card completion"><ShieldCheck/><div><small>TRIP COMPLETION OTP</small><strong>{otp}</strong><p>Share this only with your assigned driver when you are ready to complete the trip.</p><span>Waiting for verification{otpExpiresAt ? ` · expires ${indiaTime(otpExpiresAt)}` : ''}</span></div></div>}
         <div className="fare-total"><span>Current bill</span><strong>{money(booking.total)}</strong></div>
         {trip.extras.map((extra) => <div className="fare-line" key={extra.id}><span>{extra.type}: {extra.note}</span><strong>{money(extra.amount)}</strong></div>)}
         <Link className="button secondary wide" to="/support">Contact Support</Link>
       </aside>
     </div>
-    {completionOtpOpen && otp && booking.status === 'TRIP_STARTED' && <div className="modal-backdrop" role="presentation"><section className="completion-modal customer-completion-modal" role="dialog" aria-modal="true" aria-labelledby="customer-completion-title"><button className="modal-close" type="button" aria-label="Close completion OTP" onClick={() => setCompletionOtpOpen(false)}><X/></button><div className="completion-modal-icon"><ShieldCheck/></div><p className="eyebrow">TRIP COMPLETION</p><h2 id="customer-completion-title">Share this OTP with your driver</h2><p>The driver is outside the 200-metre destination zone. Share this code only when you are ready to complete the trip.</p><strong className="customer-completion-code">{otp}</strong></section></div>}
   </main>
 }
