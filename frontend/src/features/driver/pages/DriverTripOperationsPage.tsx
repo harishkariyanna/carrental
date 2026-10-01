@@ -1,7 +1,7 @@
 import { type FormEvent, useEffect, useState } from 'react'
-import { CarFront, Check, Clock3, MapPin, Navigation, ReceiptIndianRupee, ShieldCheck, WalletCards } from 'lucide-react'
+import { CarFront, Check, ChevronRight, Clock3, MapPin, Navigation, ReceiptIndianRupee, ShieldCheck, WalletCards } from 'lucide-react'
 import { api, apiUpload, type Booking, money } from '../../../api'
-import { RouteMap } from '../../../shared/maps/RouteMap'
+import { ResolvedAddress, RouteMap } from '../../../shared/maps/RouteMap'
 
 interface PaymentSummary { quoted_total: number; paid_amount: number; driver_collected_amount: number; additional_charges: number; final_total: number; amount_to_collect: number }
 interface TripView { booking: Booking; driver_location?: { latitude?: number; longitude?: number }; extras: Array<{ id: string; type: string; amount: number; note: string }>; payment_summary: PaymentSummary }
@@ -24,7 +24,14 @@ function SwipeAction({ label, onConfirm, disabled = false }: { label: string; on
     if (currentValue >= 90 && !disabled) onConfirm()
     setValue(0)
   }
-  return <label className={`swipe-action ${disabled ? 'disabled' : ''}`}><span>{label}</span><input aria-label={label} type="range" min="0" max="100" value={value} disabled={disabled} onChange={(event) => setValue(Number(event.target.value))} onPointerUp={(event) => finish(Number(event.currentTarget.value))} onKeyUp={(event) => { if (event.key === 'Enter') finish(Number(event.currentTarget.value)) }}/></label>
+  return <label className={`swipe-action ${disabled ? 'disabled' : ''}`}>
+    <span className="swipe-copy"><strong>{label}</strong><small>{value >= 90 ? 'Release to confirm' : 'Slide the handle all the way across'}</small></span>
+    <span className="swipe-track">
+      <span className="swipe-fill" style={{ width: `${value}%` }} />
+      <ChevronRight className="swipe-end" aria-hidden="true" />
+      <input aria-label={label} aria-valuetext={value >= 90 ? 'Ready to confirm' : `${value} percent`} type="range" min="0" max="100" value={value} disabled={disabled} onChange={(event) => setValue(Number(event.target.value))} onPointerUp={(event) => finish(Number(event.currentTarget.value))} onKeyUp={(event) => { if (event.key === 'Enter' || event.key === ' ') finish(Number(event.currentTarget.value)) }}/>
+    </span>
+  </label>
 }
 
 export function DriverTripOperationsPage() {
@@ -156,11 +163,11 @@ export function DriverTripOperationsPage() {
   const navigationUrl = targetLatitude != null && targetLongitude != null ? `https://www.google.com/maps/dir/?api=1&destination=${targetLatitude},${targetLongitude}&travelmode=driving` : ''
 
   return <main className="role-page">
-    <header><p className="eyebrow">ACTIVE TRIP</p><h1>{booking.public_id}</h1><p>{booking.pickup} → {booking.destination}</p></header>
+    <header><p className="eyebrow">ACTIVE TRIP</p><h1>{booking.public_id}</h1><p><ResolvedAddress label={booking.pickup} latitude={booking.pickup_latitude} longitude={booking.pickup_longitude}/> → <ResolvedAddress label={booking.destination} latitude={booking.drop_latitude} longitude={booking.drop_longitude}/></p></header>
     <div className="live-trip-grid"><RouteMap pickup={headingToDestination ? undefined : pickup} drop={headingToDestination ? drop : undefined} driver={driver}/><aside className="panel driver-ops">
       <section className="trip-progress" aria-label="Trip progress">{statusSteps.map((step, index) => <div className={index <= currentStep ? 'complete' : ''} key={step.status}><span>{index < currentStep ? <Check/> : index + 1}</span><small>{step.label}</small></div>)}</section>
       <section className="trip-operation-summary"><div><small>CURRENT STATUS</small><strong>{booking.status.replaceAll('_', ' ')}</strong></div><div><small>{estimateLabel.toUpperCase()}</small><strong>{estimate ? `${Math.max(1, Math.ceil(estimate.duration_s / 60))} min` : 'Calculating...'}</strong>{distanceLabel && <span>{distanceLabel} remaining</span>}</div></section>
-      <div className="trip-fact"><MapPin/><span>{headingToDestination ? booking.destination : booking.pickup}</span></div>
+      <div className="trip-fact"><MapPin/><span>{headingToDestination ? <ResolvedAddress label={booking.destination} latitude={booking.drop_latitude} longitude={booking.drop_longitude}/> : <ResolvedAddress label={booking.pickup} latitude={booking.pickup_latitude} longitude={booking.pickup_longitude}/>}</span></div>
       {booking.passenger_phone && <div className="contact-row"><a className="button secondary compact" href={`tel:${booking.passenger_phone}`}>Call Customer</a><a className="button secondary compact" target="_blank" rel="noreferrer" href={`https://wa.me/${booking.passenger_phone.replace(/\D/g, '')}`}>WhatsApp</a></div>}
       {navigationUrl && !['DRIVER_ARRIVED', 'DESTINATION_REACHED', 'COMPLETION_OTP_PENDING'].includes(booking.status) && <a className="button secondary wide" href={navigationUrl} target="_blank" rel="noreferrer"><Navigation/> Open in Google Maps</a>}
       {booking.status === 'DRIVER_ACCEPTED' && <button className="button wide" onClick={startNavigation}><Navigation/> Start Navigation</button>}

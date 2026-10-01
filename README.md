@@ -34,6 +34,7 @@ Open `http://127.0.0.1:5173` (or use `localhost` consistently for both services)
 | Customer | `ridex.customer@mailinator.com` | `Customer@123` |
 | Driver | `ridex.driver@mailinator.com` | `Driver@123` |
 | Admin | Configured through `SEED_ADMIN_EMAIL` | Configured privately through `SEED_ADMIN_PASSWORD` |
+| Super Admin | Configured through `SEED_SUPER_ADMIN_EMAIL` | Configured privately through `SEED_SUPER_ADMIN_PASSWORD` |
 
 Demo accounts exist only when `DEMO_MODE=true` or `SEED_DEMO_DATA=true`.
 
@@ -196,7 +197,7 @@ npm --prefix frontend run build
 
 ## Render Backend
 
-Create a Render Blueprint from [render.yaml](render.yaml). Set every `sync: false` secret in the Render dashboard. Set `ALLOWED_ORIGINS` to the exact Vercel URL, for example `https://ridex.example.com`, without a trailing slash.
+Create a Render Blueprint from [render.yaml](render.yaml). Set every `sync: false` secret in the Render dashboard, including both Admin and Super Admin seed credentials. Set `ALLOWED_ORIGINS` to the exact Vercel URL, for example `https://ridex.example.com`, without a trailing slash.
 
 `ALLOW_TEST_PAYMENTS` defaults to `false` in the Blueprint. Change it to `true` only for temporary deployed workflow testing, then restore `false` during the Razorpay production cutover.
 
@@ -212,6 +213,7 @@ Import the repository, set the Root Directory to `frontend`, and use the detecte
 
 ```text
 VITE_API_URL=https://YOUR-RENDER-SERVICE.onrender.com/api/v1
+VITE_DEMO_MODE=false
 VITE_GOOGLE_MAPS_API_KEY=...
 VITE_GOOGLE_REVIEW_URL=...
 VITE_RAZORPAY_KEY_ID=...

@@ -26,14 +26,26 @@ from .controllers.media_controller import router as media_router
 from .controllers.trip_controller import router as trip_router
 from .database import public, utcnow
 from .dependencies import require_active_driver, require_verified_driver, settings, store
-from .schemas import BookingCreate, CouponInput, CustomerProfileUpdate, DriverAssignment, DriverCreate, DriverUpdate, LoginRequest, PlatformSettingsUpdate, PricingRuleInput, QuoteRequest, RegisterRequest, ReviewCreate, ReviewModeration, SavedLocationInput, ServiceType, TripTransition, UserUpdate, VehicleDriverAssignment, VehicleInput, VehicleUpdate
+from .schemas import AdminAccountCreate, AdminAccountUpdate, BookingCreate, CouponInput, CustomerProfileUpdate, DriverAssignment, DriverCreate, DriverUpdate, LoginRequest, PlatformSettingsUpdate, PricingRuleInput, QuoteRequest, RegisterRequest, ReviewCreate, ReviewModeration, SavedLocationInput, ServiceType, SuperAdminSettingsUpdate, TripTransition, UserUpdate, VehicleDriverAssignment, VehicleInput, VehicleUpdate
 from .security import create_session_token, hash_password, optional_session_claims, require_roles, session_claims, verify_access_token, verify_password
 from .services.map_service import MapService
 from .services.email_service import EmailDeliveryService, email_worker
 from .services.live_location_service import live_locations
 from .services.pricing_service import calculate_vehicle_quote, public_vehicle
+from .services.google_review_refresh_service import GoogleReviewRefreshService
 
 email_delivery = EmailDeliveryService(store, settings)
+
+DEFAULT_GOOGLE_REVIEW_SNAPSHOT = {
+    "business_name": "Konanur Tours and Travels",
+    "place_id": "ChIJiVvOuNwbrjsRDAOYVBwSl6M",
+    "profile_url": "https://share.google/008bQrAOrtyDw5XR2",
+    "review_url": "https://share.google/008bQrAOrtyDw5XR2",
+    "rating": 5.0,
+    "review_count": 3,
+    "address": "No. 87, Hittramali Gate, near Akhilandeshwari Temple, Budigere, Bangalore, Karnataka 562129",
+    "refreshed_at": None,
+}
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -83,10 +95,8 @@ async def current_user(claims: dict[str, str] = Depends(session_claims)) -> dict
 async def quote_total(request: QuoteRequest, vehicle: dict[str, Any], distance_km: float | None = None) -> tuple[int, list[dict[str, Any]], dict[str, Any]]:
     rule = await store.find_one("pricing_rules", {"service_type": request.service_type.value, "vehicle_category": vehicle["category"], "status": "ACTIVE"})
     if not rule:
-        if request.service_type.value in {"NORMAL", "OUTSTATION"}:
-            rule = {"base_fare": vehicle.get("base_rate", 0), "driver_allowance": 0, "tax_percent": 5}
-        else:
-            raise HTTPException(status_code=422, detail=f"No active pricing rule for {request.service_type.value} / {vehicle['category']}")
+        multiplier = {"AIRPORT": 1.25, "OUTSTATION": 1.9}.get(request.service_type.value, 1)
+        rule = {"base_fare": round(vehicle.get("base_rate", 0) * multiplier), "per_km": vehicle.get("local_per_km", 18), "extra_hour": 200, "driver_allowance": 300 if request.service_type.value == "OUTSTATION" else 0, "tax_percent": 5, "included_hours": 4, "round_trip_multiplier": 2}
     return calculate_vehicle_quote(service_type=request.service_type.value, vehicle=vehicle, rule=rule, distance_km=distance_km, round_trip=request.round_trip, scheduled_at=request.scheduled_at, return_at=request.return_at, package_hours=request.package_hours, ac_required=request.ac_required)
 
 
@@ -118,7 +128,7 @@ async def driver_assignment_eligibility(driver_id: str, booking: dict[str, Any])
     if not profile or profile.get("verification_status") != "VERIFIED":
         return driver, profile, "Driver is not approved"
     if profile.get("schedule_availability", "AVAILABLE") != "AVAILABLE":
-        return driver, profile, "Driver is marked unavailable by admin"
+        return driver, profile, "Driver is on leave"
     requested_start, requested_end, _ = booking_schedule(booking)
     for existing in await store.find_many("bookings", {"driver_id": driver_id}, limit=10_000):
         if existing.get("_id") == booking.get("_id") or existing.get("status") not in DRIVER_SCHEDULE_STATES:
@@ -251,11 +261,33 @@ async def enrich_booking(booking: dict[str, Any]) -> dict[str, Any]:
     return {**(public(booking) or {}), "customer": public(customer), "driver": public(driver), "default_driver": public(default_driver), "driver_location": driver_location, "vehicle": public(vehicle)}
 
 
-async def confirm_payment(payment: dict[str, Any], provider_payment_id: str) -> dict[str, Any]:
+async def record_service_fee(payment: dict[str, Any]) -> None:
+    percentage = float(payment.get("service_fee_percentage", 0))
+    total = int(payment["booking_total"])
+    calculated_fee = round(total * percentage / 100)
+    record = {
+        "booking_id": payment["booking_id"],
+        "payment_id": payment["_id"],
+        "configured_percentage": percentage,
+        "effective_at": payment.get("service_fee_effective_at"),
+        "total_booking_amount": total,
+        "calculated_service_fee": calculated_fee,
+        "amount_collected": int(payment["amount"]),
+        "fee_status": "COLLECTED" if int(payment["amount"]) >= calculated_fee else "PARTIALLY_COLLECTED",
+    }
+    existing = await store.find_one("service_fee_records", {"payment_id": payment["_id"]})
+    if existing:
+        await store.update("service_fee_records", existing["_id"], record)
+    else:
+        await store.insert("service_fee_records", record)
+
+
+async def confirm_payment(payment: dict[str, Any], provider_payment_id: str, verification: dict[str, Any] | None = None) -> dict[str, Any]:
     booking = await store.find_one("bookings", {"_id": payment["booking_id"]})
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
     if payment.get("status") == "PAID":
+        await record_service_fee(payment)
         if not booking.get("driver_id") and booking.get("status") == "CONFIRMED":
             return await auto_assign_vehicle_driver(booking)
         return booking
@@ -268,7 +300,25 @@ async def confirm_payment(payment: dict[str, Any], provider_payment_id: str) -> 
         except DuplicateKeyError as exc:
             raise HTTPException(status_code=409, detail="This coupon has already been used by this customer") from exc
         await store.update("coupons", coupon["_id"], {"used_count": coupon.get("used_count", 0) + 1})
-    await store.update("payments", payment["_id"], {"status": "PAID", "provider_payment_id": provider_payment_id, "verified_at": utcnow()})
+    verification = verification or {}
+    payment_time = utcnow()
+    payment_changes = {
+        "status": "PAID",
+        "payment_status": "SUCCESS",
+        "provider_payment_id": provider_payment_id,
+        "razorpay_payment_id": provider_payment_id,
+        "razorpay_order_id": payment["provider_order_id"],
+        "razorpay_signature": verification.get("signature"),
+        "verification_source": verification.get("source", "DEMO"),
+        "verification_details": verification.get("details", {}),
+        "upi_transaction_id": verification.get("upi_transaction_id"),
+        "payment_method": verification.get("method", payment.get("method", "UPI")),
+        "amount_paid": int(payment["amount"]),
+        "payment_timestamp": payment_time,
+        "verified_at": payment_time,
+    }
+    confirmed_payment = await store.update("payments", payment["_id"], payment_changes) or {**payment, **payment_changes}
+    await record_service_fee(confirmed_payment)
     paid_amount = int(booking.get("paid_amount", 0)) + int(payment["amount"])
     payment_status = "PAID" if paid_amount >= int(booking["total"]) else "ADVANCE_PAID"
     updated = await store.update("bookings", booking["_id"], {"status": "CONFIRMED", "payment_status": payment_status, "paid_amount": paid_amount, "balance_due": max(0, int(booking["total"]) - paid_amount), "version": booking.get("version", 1) + 1})
@@ -278,6 +328,47 @@ async def confirm_payment(payment: dict[str, Any], provider_payment_id: str) -> 
     updated = await auto_assign_vehicle_driver(updated or booking)
     await add_notification(booking["customer_id"], "BOOKING_CONFIRMED", "Booking confirmed", f"Booking {booking['public_id']} is confirmed.")
     return updated or booking
+
+
+def demo_payments_enabled() -> bool:
+    return settings.demo_mode or settings.allow_test_payments
+
+
+async def service_fee_snapshot() -> tuple[float, datetime]:
+    configured = await store.find_one("service_fee_settings", {"_id": "current"}) or {}
+    return float(configured.get("application_service_fee_percent", 2)), configured.get("effective_at", utcnow())
+
+
+async def create_provider_order(amount: int, currency: str, receipt: str, booking_id: str) -> str:
+    if demo_payments_enabled():
+        return f"order_demo_{uuid4().hex[:16]}"
+    if not settings.razorpay_key_id or not settings.razorpay_key_secret:
+        raise HTTPException(status_code=503, detail="Razorpay is not configured")
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.post(
+            f"{settings.razorpay_api_url}/orders",
+            auth=(settings.razorpay_key_id, settings.razorpay_key_secret),
+            json={"amount": amount * 100, "currency": currency, "receipt": receipt[:40], "notes": {"booking_id": booking_id}},
+        )
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="Unable to create Razorpay order")
+    return str(response.json()["id"])
+
+
+async def verified_provider_payment(provider_payment_id: str, payment: dict[str, Any]) -> dict[str, Any]:
+    if not settings.razorpay_key_id or not settings.razorpay_key_secret:
+        raise HTTPException(status_code=503, detail="Razorpay is not configured")
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.get(
+            f"{settings.razorpay_api_url}/payments/{provider_payment_id}",
+            auth=(settings.razorpay_key_id, settings.razorpay_key_secret),
+        )
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="Unable to verify payment with Razorpay")
+    provider = response.json()
+    if provider.get("status") != "captured" or provider.get("order_id") != payment["provider_order_id"] or provider.get("amount") != int(payment["amount"]) * 100 or provider.get("currency") != payment["currency"]:
+        raise HTTPException(status_code=409, detail="Razorpay has not confirmed this payment as captured")
+    return provider
 
 
 async def payment_policy(booking: dict[str, Any]) -> tuple[int, str, dict[str, Any]]:
@@ -348,7 +439,7 @@ async def register(payload: RegisterRequest, response: Response) -> dict[str, st
     try:
         await store.insert("users", user)
         if payload.role == "DRIVER":
-            await store.insert("drivers", {"user_id": user["_id"], "schedule_availability": "AVAILABLE", "online_status": "OFFLINE", "verification_status": "PENDING", "license_number": payload.license_number, "license_expiry": payload.license_expiry, "documents_status": "INCOMPLETE", "rating": 0, "earnings": 0})
+            await store.insert("drivers", {"user_id": user["_id"], "schedule_availability": "UNAVAILABLE", "online_status": "OFFLINE", "verification_status": "PENDING", "license_number": payload.license_number, "license_expiry": payload.license_expiry, "documents_status": "INCOMPLETE", "rating": 0, "earnings": 0})
     except DuplicateKeyError as exc:
         raise HTTPException(status_code=409, detail="An account with this email already exists") from exc
     await add_notification(user["_id"], "ACCOUNT_CREATED", "Welcome to RideX" if payload.role == "CUSTOMER" else "Driver application started", "Your RideX account is ready." if payload.role == "CUSTOMER" else "Upload your licence, vehicle photos, and address proof to submit your driver application for review.")
@@ -491,7 +582,8 @@ async def reset_password(payload: dict[str, str]) -> dict[str, str]:
 
 @app.get(f"{settings.api_prefix}/vehicles")
 async def vehicles() -> list[dict[str, Any]]:
-    return [public_vehicle(item, public) for item in await store.find_many("vehicles", {"status": "AVAILABLE"})]
+    supported = ["SEDAN_CNG", "SEDAN_NON_CNG", "ERTIGA", "INNOVA", "INNOVA_CRYSTA", "TT"]
+    return [public_vehicle(item, public) for item in await store.find_many("vehicles", {"status": {"$in": ["ACTIVE", "AVAILABLE"]}, "category": {"$in": supported}})]
 
 
 @app.get(f"{settings.api_prefix}/vehicles/{{vehicle_id}}")
@@ -506,7 +598,19 @@ async def vehicle_detail(vehicle_id: str) -> dict[str, Any]:
 async def create_quotes(payload: QuoteRequest, claims: dict[str, str] | None = Depends(optional_session_claims)) -> dict[str, Any]:
     if payload.service_type.value != "HOURLY" and not payload.destination:
         raise HTTPException(status_code=422, detail="Destination is required for this service")
-    available = await store.find_many("vehicles", {"status": "AVAILABLE"})
+    supported = ["SEDAN_CNG", "SEDAN_NON_CNG", "ERTIGA", "INNOVA", "INNOVA_CRYSTA", "TT"]
+    available = await store.find_many("vehicles", {"status": {"$in": ["ACTIVE", "AVAILABLE"]}, "category": {"$in": supported}})
+    requested_slots = reservation_slots(payload.model_dump(mode="json"))
+    unexpired_reservations = set()
+    for reservation in await store.find_many("vehicle_reservations", {"slot": {"$in": requested_slots}}, limit=10_000):
+        held_booking = await store.find_one("bookings", {"_id": reservation.get("booking_id")})
+        own_pending_hold = bool(claims and claims.get("role") == "CUSTOMER" and held_booking and held_booking.get("customer_id") == claims.get("sub") and held_booking.get("status") == "PENDING_PAYMENT")
+        if own_pending_hold:
+            continue
+        expiry = as_utc_datetime(reservation["expires_at"])
+        if reservation.get("status") == "ACTIVE" or expiry > utcnow():
+            unexpired_reservations.add(reservation["vehicle_id"])
+    available = [vehicle for vehicle in available if vehicle["_id"] not in unexpired_reservations]
     eligible = [v for v in available if v["seats"] >= payload.passengers and v["luggage"] >= payload.luggage and (payload.service_type.value != "OUTSTATION" or not payload.ac_required or v.get("has_ac", False))]
     route = None
     if payload.service_type.value in {"NORMAL", "OUTSTATION"} and None not in {payload.pickup_latitude, payload.pickup_longitude, payload.drop_latitude, payload.drop_longitude}:
@@ -579,6 +683,16 @@ async def list_bookings(user: dict[str, Any] = Depends(current_user)) -> list[di
     return [public(item) for item in await store.find_many("bookings", query) if item]
 
 
+@app.get(f"{settings.api_prefix}/customer/payments")
+async def customer_payments(customer: dict[str, str] = Depends(require_roles("CUSTOMER"))) -> list[dict[str, Any]]:
+    bookings = await store.find_many("bookings", {"customer_id": customer["sub"]}, limit=10_000)
+    booking_by_id = {booking["_id"]: booking for booking in bookings}
+    payments = await store.find_many("payments", limit=1000)
+    visible = [payment for payment in payments if payment.get("booking_id") in booking_by_id]
+    visible.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
+    return [{**(public(payment) or {}), "booking_public_id": booking_by_id[payment["booking_id"]].get("public_id")} for payment in visible]
+
+
 @app.post(f"{settings.api_prefix}/bookings/{{booking_id}}/cancel", dependencies=[Depends(verify_access_token)])
 async def cancel_booking(booking_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     booking = await store.find_one("bookings", {"_id": booking_id})
@@ -615,23 +729,34 @@ async def payment_order(booking_id: str, user: dict[str, Any] = Depends(current_
     booking = await store.find_one("bookings", {"_id": booking_id})
     if not booking or (user["role"] == "CUSTOMER" and booking["customer_id"] != user["_id"]):
         raise HTTPException(status_code=404, detail="Booking not found")
-    test_payments_enabled = settings.app_env != "production" or settings.allow_test_payments
+    test_payments_enabled = demo_payments_enabled()
     existing = await store.find_one("payments", {"booking_id": booking_id})
     if existing:
         if existing.get("status") == "PAID":
             return {**(public(existing) or {}), "qr_url": None}
         amount, payment_type, platform = await payment_policy(booking)
         upi_id = platform.get("upi_id", "ridex@upi")
-        stale_order = not existing.get("upi_uri") or int(existing.get("amount", 0)) != amount or int(existing.get("booking_total", 0)) != int(booking["total"]) or existing.get("payment_type") != payment_type or existing.get("upi_id") != upi_id
+        stale_order = (test_payments_enabled and not existing.get("upi_uri")) or int(existing.get("amount", 0)) != amount or int(existing.get("booking_total", 0)) != int(booking["total"]) or existing.get("payment_type") != payment_type or existing.get("upi_id") != upi_id
         if stale_order:
-            order_id = f"ridex_{uuid4().hex[:16]}"
-            existing = await store.update("payments", existing["_id"], {"provider_order_id": order_id, "amount": amount, "booking_total": booking["total"], "currency": booking["currency"], "status": "CREATED", "method": "UPI_QR", "payment_type": payment_type, "upi_id": upi_id, "upi_uri": upi_payment_uri(upi_id, amount, order_id), "demo": test_payments_enabled}) or existing
-        return {**(public(existing) or {}), "demo": test_payments_enabled, "qr_url": f"/payments/{existing['_id']}/qr"}
+            order_id = await create_provider_order(amount, booking["currency"], booking["public_id"], booking_id)
+            percentage, effective_at = await service_fee_snapshot()
+            existing = await store.update("payments", existing["_id"], {"provider_order_id": order_id, "razorpay_order_id": order_id, "amount": amount, "advance_amount": amount, "amount_paid": 0, "booking_total": booking["total"], "total_booking_amount": booking["total"], "currency": booking["currency"], "status": "CREATED", "payment_status": "CREATED", "method": "DEMO" if test_payments_enabled else "RAZORPAY", "payment_method": "DEMO" if test_payments_enabled else "UPI", "payment_type": payment_type, "upi_id": upi_id, "upi_uri": upi_payment_uri(upi_id, amount, order_id) if test_payments_enabled else None, "demo": test_payments_enabled, "refund_status": "NOT_REQUESTED", "service_fee_percentage": percentage, "service_fee_effective_at": effective_at}) or existing
+        return {**(public(existing) or {}), "demo": test_payments_enabled, "key_id": None if test_payments_enabled else settings.razorpay_key_id, "qr_url": f"/payments/{existing['_id']}/qr" if test_payments_enabled else None}
     amount, payment_type, platform = await payment_policy(booking)
-    order_id = f"ridex_{uuid4().hex[:16]}"
+    order_id = await create_provider_order(amount, booking["currency"], booking["public_id"], booking_id)
+    percentage, effective_at = await service_fee_snapshot()
     upi_id = platform.get("upi_id", "ridex@upi")
-    payment = await store.insert("payments", {"booking_id": booking_id, "provider_order_id": order_id, "amount": amount, "booking_total": booking["total"], "currency": booking["currency"], "status": "CREATED", "method": "UPI_QR", "payment_type": payment_type, "upi_id": upi_id, "upi_uri": upi_payment_uri(upi_id, amount, order_id), "demo": test_payments_enabled})
-    return {**(public(payment) or {}), "qr_url": f"/payments/{payment['_id']}/qr"}
+    payment = await store.insert("payments", {"customer_id": booking["customer_id"], "booking_id": booking_id, "provider_order_id": order_id, "razorpay_order_id": order_id, "amount": amount, "advance_amount": amount, "amount_paid": 0, "booking_total": booking["total"], "total_booking_amount": booking["total"], "currency": booking["currency"], "status": "CREATED", "payment_status": "CREATED", "method": "DEMO" if test_payments_enabled else "RAZORPAY", "payment_method": "DEMO" if test_payments_enabled else "UPI", "payment_type": payment_type, "upi_id": upi_id, "upi_uri": upi_payment_uri(upi_id, amount, order_id) if test_payments_enabled else None, "demo": test_payments_enabled, "refund_status": "NOT_REQUESTED", "service_fee_percentage": percentage, "service_fee_effective_at": effective_at})
+    return {**(public(payment) or {}), "key_id": None if test_payments_enabled else settings.razorpay_key_id, "qr_url": f"/payments/{payment['_id']}/qr" if test_payments_enabled else None}
+
+
+@app.get(f"{settings.api_prefix}/payments/{{payment_id}}")
+async def payment_status(payment_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    payment = await store.find_one("payments", {"_id": payment_id})
+    booking = await store.find_one("bookings", {"_id": payment.get("booking_id")}) if payment else None
+    if not payment or not booking or (user["role"] == "CUSTOMER" and booking["customer_id"] != user["_id"]):
+        raise HTTPException(status_code=404, detail="Payment not found")
+    return public(payment) or {}
 
 
 @app.get(f"{settings.api_prefix}/payments/{{payment_id}}/qr")
@@ -651,15 +776,18 @@ async def payment_qr(payment_id: str, user: dict[str, Any] = Depends(current_use
 
 @app.post(f"{settings.api_prefix}/payments/{{payment_id}}/demo-confirm", dependencies=[Depends(verify_access_token)])
 async def demo_confirm(payment_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    if settings.app_env == "production" and not settings.allow_test_payments:
+    if not demo_payments_enabled():
         raise HTTPException(status_code=404, detail="Not available")
     payment = await store.find_one("payments", {"_id": payment_id})
     if not payment:
         raise HTTPException(status_code=404, detail="Payment not found")
+    if not payment.get("demo"):
+        raise HTTPException(status_code=403, detail="This is not a demo payment")
     booking = await store.find_one("bookings", {"_id": payment["booking_id"]})
     if not booking or (user["role"] == "CUSTOMER" and booking["customer_id"] != user["_id"]):
         raise HTTPException(status_code=404, detail="Booking not found")
-    updated = await confirm_payment(payment, f"pay_demo_{uuid4().hex[:12]}")
+    demo_payment_id = f"pay_demo_{uuid4().hex[:12]}"
+    updated = await confirm_payment(payment, demo_payment_id, {"source": "DEMO_BACKEND", "method": "DEMO", "upi_transaction_id": f"DEMO_TXN_{uuid4().hex[:12].upper()}", "details": {"verified": True, "environment": "demo"}})
     return public(updated) or {}
 
 
@@ -677,7 +805,9 @@ async def verify_checkout_payment(payment_id: str, payload: dict[str, str], user
     expected = hmac.new(settings.razorpay_key_secret.encode(), signed, sha256).hexdigest()
     if not settings.razorpay_key_secret or not hmac.compare_digest(signature, expected):
         raise HTTPException(status_code=400, detail="Invalid payment signature")
-    return public(await confirm_payment(payment, provider_payment_id)) or {}
+    provider = await verified_provider_payment(provider_payment_id, payment)
+    verification = {"source": "RAZORPAY_API", "signature": signature, "method": provider.get("method", "upi"), "upi_transaction_id": provider.get("acquirer_data", {}).get("upi_transaction_id") or provider.get("acquirer_data", {}).get("rrn"), "details": {"status": provider.get("status"), "captured": provider.get("captured"), "vpa": provider.get("vpa")}}
+    return public(await confirm_payment(payment, provider_payment_id, verification)) or {}
 
 
 @app.post(f"{settings.api_prefix}/webhooks/razorpay")
@@ -698,7 +828,8 @@ async def razorpay_webhook(request: Request) -> dict[str, bool]:
         if payment:
             if entity.get("amount") != payment["amount"] * 100 or entity.get("currency") != payment["currency"]:
                 raise HTTPException(status_code=400, detail="Webhook payment amount mismatch")
-            await confirm_payment(payment, entity.get("id", ""))
+            verification = {"source": "RAZORPAY_WEBHOOK", "method": entity.get("method", "upi"), "upi_transaction_id": entity.get("acquirer_data", {}).get("upi_transaction_id") or entity.get("acquirer_data", {}).get("rrn"), "details": {"event_id": event_id, "status": entity.get("status"), "captured": entity.get("captured"), "vpa": entity.get("vpa")}}
+            await confirm_payment(payment, entity.get("id", ""), verification)
     webhook_record = await store.find_one("payment_webhook_events", {"provider_event_id": event_id})
     if webhook_record:
         await store.update("payment_webhook_events", webhook_record["_id"], {"status": "PROCESSED"})
@@ -721,6 +852,28 @@ async def read_notification(notification_id: str, user: dict[str, Any] = Depends
 @app.get(f"{settings.api_prefix}/reviews")
 async def public_reviews() -> list[dict[str, Any]]:
     return [public(item) for item in await store.find_many("reviews", {"status": "PUBLISHED"}) if item]
+
+
+@app.get(f"{settings.api_prefix}/reviews/google")
+async def google_review_snapshot() -> dict[str, Any]:
+    snapshot = await store.find_one("google_review_snapshots", {"_id": "current"})
+    return public(snapshot) or DEFAULT_GOOGLE_REVIEW_SNAPSHOT
+
+
+@app.post(f"{settings.api_prefix}/admin/reviews/google/refresh", dependencies=[Depends(verify_access_token)])
+async def refresh_google_reviews(admin: dict[str, str] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
+    current = await store.find_one("google_review_snapshots", {"_id": "current"})
+    try:
+        fetched = await GoogleReviewRefreshService().fetch()
+    except HTTPException as exc:
+        if not current:
+            raise HTTPException(status_code=503, detail="Google did not provide new review data. Please try again later.") from exc
+        await audit_admin(admin["sub"], "GOOGLE_REVIEWS_REFRESH_FAILED", "google_review_snapshot", "current", {"reason": exc.detail})
+        return {**(public(current) or {}), "refresh_warning": "Google did not provide new data. The existing review summary is unchanged."}
+    changes = {**fetched, "refreshed_at": utcnow(), "refreshed_by": admin["sub"]}
+    saved = await store.update("google_review_snapshots", "current", changes) if current else await store.insert("google_review_snapshots", {"_id": "current", **changes})
+    await audit_admin(admin["sub"], "GOOGLE_REVIEWS_REFRESHED", "google_review_snapshot", "current", {"rating": fetched["rating"], "review_count": fetched["review_count"]})
+    return public(saved) or changes
 
 
 @app.post(f"{settings.api_prefix}/bookings/{{booking_id}}/reviews", status_code=201, dependencies=[Depends(verify_access_token)])
@@ -821,7 +974,7 @@ async def admin_dashboard(_: dict[str, str] = Depends(require_roles("ADMIN"))) -
 
 @app.get(f"{settings.api_prefix}/admin/users")
 async def admin_users(_: dict[str, str] = Depends(require_roles("ADMIN"))) -> list[dict[str, Any]]:
-    users = await store.find_many("users", limit=1000)
+    users = [user for user in await store.find_many("users", limit=1000) if user.get("role") != "SUPER_ADMIN"]
     bookings = await store.find_many("bookings", limit=10_000)
     reviews = await store.find_many("reviews", limit=10_000)
     return [{**(public(item) or {}), "booking_count": sum(b.get("customer_id") == item["_id"] for b in bookings), "review_count": sum(r.get("customer_id") == item["_id"] for r in reviews), "total_spent": sum(b.get("total", 0) for b in bookings if b.get("customer_id") == item["_id"] and b.get("payment_status") == "PAID")} for item in users]
@@ -829,6 +982,9 @@ async def admin_users(_: dict[str, str] = Depends(require_roles("ADMIN"))) -> li
 
 @app.patch(f"{settings.api_prefix}/admin/users/{{user_id}}", dependencies=[Depends(verify_access_token)])
 async def admin_update_user(user_id: str, payload: UserUpdate, admin: dict[str, str] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
+    target = await store.find_one("users", {"_id": user_id})
+    if target and target.get("role") == "SUPER_ADMIN":
+        raise HTTPException(status_code=403, detail="Super Admin accounts cannot be managed here")
     changes = payload.model_dump(exclude_none=True)
     updated = await store.update("users", user_id, changes)
     if not updated:
@@ -853,7 +1009,7 @@ async def admin_create_driver(payload: DriverCreate, admin: dict[str, str] = Dep
         raise HTTPException(status_code=409, detail="Email already exists")
     password_digest, password_salt = hash_password(payload.password)
     user = await store.insert("users", {"name": payload.name, "email": payload.email.lower(), "phone": payload.phone, "role": "DRIVER", "status": "ACTIVE", "password_hash": password_digest, "password_salt": password_salt})
-    profile = await store.insert("drivers", {"user_id": user["_id"], "schedule_availability": "AVAILABLE", "online_status": "OFFLINE", "verification_status": "PENDING", "license_number": payload.license_number, "license_expiry": payload.license_expiry, "rating": 0, "earnings": 0})
+    profile = await store.insert("drivers", {"user_id": user["_id"], "schedule_availability": "UNAVAILABLE", "online_status": "OFFLINE", "verification_status": "PENDING", "license_number": payload.license_number, "license_expiry": payload.license_expiry, "rating": 0, "earnings": 0})
     await audit_admin(admin["sub"], "DRIVER_CREATED", "driver", user["_id"])
     return {**(public(user) or {}), "profile": public(profile)}
 
@@ -868,6 +1024,10 @@ async def admin_update_driver(driver_id: str, payload: DriverUpdate, admin: dict
     if user_status:
         user = await store.update("users", driver_id, {"status": user_status}) or user
     profile = await store.find_one("drivers", {"user_id": driver_id})
+    if changes.get("schedule_availability") == "AVAILABLE" and (not profile or profile.get("online_status") != "ONLINE"):
+        raise HTTPException(status_code=409, detail="Driver must start duty from the driver app with live location")
+    if changes.get("schedule_availability") == "UNAVAILABLE":
+        changes["online_status"] = "OFFLINE"
     if changes.get("verification_status") == "VERIFIED" and (not profile or profile.get("documents_status") != "SUBMITTED"):
         raise HTTPException(status_code=409, detail="Driver must submit all required documents before approval")
     if changes.get("verification_status") == "VERIFIED":
@@ -893,6 +1053,28 @@ async def admin_update_driver(driver_id: str, payload: DriverUpdate, admin: dict
 @app.get(f"{settings.api_prefix}/admin/bookings")
 async def admin_bookings(_: dict[str, str] = Depends(require_roles("ADMIN"))) -> list[dict[str, Any]]:
     return [await enrich_booking(item) for item in await store.find_many("bookings", limit=1000)]
+
+
+@app.get(f"{settings.api_prefix}/admin/bookings/calendar")
+async def admin_bookings_calendar(start: str, end: str, _: dict[str, str] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
+    try:
+        start_at = datetime.fromisoformat(f"{start}T00:00:00+00:00")
+        end_at = datetime.fromisoformat(f"{end}T23:59:59.999999+00:00")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Calendar dates must use YYYY-MM-DD") from exc
+    if end_at < start_at:
+        raise HTTPException(status_code=422, detail="Calendar end date must be on or after start date")
+    if end_at - start_at > timedelta(days=62):
+        raise HTTPException(status_code=422, detail="Calendar range cannot exceed 62 days")
+    bookings = []
+    for booking in await store.find_many("bookings", limit=10_000):
+        scheduled_at = datetime.fromisoformat(str(booking["scheduled_at"]).replace("Z", "+00:00"))
+        if scheduled_at.tzinfo is None:
+            scheduled_at = scheduled_at.replace(tzinfo=UTC)
+        if start_at <= scheduled_at <= end_at:
+            bookings.append(await enrich_booking(booking))
+    bookings.sort(key=lambda item: str(item.get("scheduled_at", "")))
+    return {"start": start, "end": end, "bookings": bookings}
 
 
 @app.get(f"{settings.api_prefix}/admin/bookings/{{booking_id}}")
@@ -928,7 +1110,16 @@ async def admin_payments(_: dict[str, str] = Depends(require_roles("ADMIN"))) ->
 
 @app.get(f"{settings.api_prefix}/admin/vehicles")
 async def admin_vehicles(_: dict[str, str] = Depends(require_roles("ADMIN"))) -> list[dict[str, Any]]:
-    return [public_vehicle(item, public) for item in await store.find_many("vehicles", limit=1000)]
+    bookings = await store.find_many("bookings", limit=10_000)
+    blocked_states = {"CANCELLED", "REFUND_PENDING", "REFUNDED", "TRIP_COMPLETED"}
+    result = []
+    for vehicle in await store.find_many("vehicles", limit=1000):
+        future = sorted(
+            (booking for booking in bookings if booking.get("vehicle_id") == vehicle["_id"] and booking.get("status") not in blocked_states and as_utc_datetime(booking["scheduled_at"]) >= utcnow()),
+            key=lambda item: str(item.get("scheduled_at", "")),
+        )
+        result.append({**public_vehicle(vehicle, public), "future_booking_count": len(future), "next_booking_at": future[0]["scheduled_at"] if future else None})
+    return result
 
 
 @app.post(f"{settings.api_prefix}/admin/vehicles", status_code=201, dependencies=[Depends(verify_access_token)])
@@ -1181,6 +1372,110 @@ async def admin_update_settings(payload: PlatformSettingsUpdate, admin: dict[str
     return public(updated) or {}
 
 
+@app.get(f"{settings.api_prefix}/super-admin/settings")
+async def super_admin_settings(_: dict[str, str] = Depends(require_roles("SUPER_ADMIN"))) -> dict[str, Any]:
+    current = await store.find_one("service_fee_settings", {"_id": "current"})
+    if not current:
+        current = await store.insert("service_fee_settings", {"_id": "current", "application_service_fee_percent": 2, "effective_at": utcnow(), "configured_by": "system"})
+    return public(current) or {}
+
+
+@app.patch(f"{settings.api_prefix}/super-admin/settings", dependencies=[Depends(verify_access_token)])
+async def update_super_admin_settings(payload: SuperAdminSettingsUpdate, owner: dict[str, str] = Depends(require_roles("SUPER_ADMIN"))) -> dict[str, Any]:
+    effective_at = utcnow()
+    changes = {"application_service_fee_percent": payload.application_service_fee_percent, "effective_at": effective_at, "configured_by": owner["sub"]}
+    current = await store.find_one("service_fee_settings", {"_id": "current"})
+    updated = await store.update("service_fee_settings", "current", changes) if current else await store.insert("service_fee_settings", {"_id": "current", **changes})
+    await store.insert("service_fee_settings", {"application_service_fee_percent": payload.application_service_fee_percent, "effective_at": effective_at, "configured_by": owner["sub"], "record_type": "HISTORY"})
+    await audit_admin(owner["sub"], "SERVICE_FEE_UPDATED", "service_fee_settings", "current", changes)
+    return public(updated) or {}
+
+
+@app.get(f"{settings.api_prefix}/super-admin/fees")
+async def super_admin_fees(_: dict[str, str] = Depends(require_roles("SUPER_ADMIN"))) -> list[dict[str, Any]]:
+    records = await store.find_many("service_fee_records", limit=1000)
+    return [public(record) or {} for record in sorted(records, key=lambda item: str(item.get("created_at", "")), reverse=True)]
+
+
+@app.get(f"{settings.api_prefix}/super-admin/payments")
+async def super_admin_payments(_: dict[str, str] = Depends(require_roles("SUPER_ADMIN"))) -> list[dict[str, Any]]:
+    payments = await store.find_many("payments", limit=1000)
+    return [public(payment) or {} for payment in sorted(payments, key=lambda item: str(item.get("created_at", "")), reverse=True)]
+
+
+@app.get(f"{settings.api_prefix}/super-admin/admins")
+async def super_admin_admins(_: dict[str, str] = Depends(require_roles("SUPER_ADMIN"))) -> list[dict[str, Any]]:
+    admins = await store.find_many("users", {"role": "ADMIN"}, limit=1000)
+    visible = [admin for admin in admins if admin.get("status") != "DELETED"]
+    return [public(admin) or {} for admin in sorted(visible, key=lambda item: str(item.get("created_at", "")), reverse=True)]
+
+
+@app.post(f"{settings.api_prefix}/super-admin/admins", status_code=201, dependencies=[Depends(verify_access_token)])
+async def super_admin_create_admin(payload: AdminAccountCreate, owner: dict[str, str] = Depends(require_roles("SUPER_ADMIN"))) -> dict[str, Any]:
+    email = str(payload.email).lower()
+    existing = await store.find_one("users", {"email": email})
+    password_digest, password_salt = hash_password(payload.password)
+    admin_data = {"name": payload.name, "email": email, "phone": payload.phone, "role": "ADMIN", "status": "ACTIVE", "password_hash": password_digest, "password_salt": password_salt, "deleted_at": None}
+    if existing:
+        if existing.get("role") != "ADMIN" or existing.get("status") != "DELETED":
+            raise HTTPException(status_code=409, detail="An account already uses this email")
+        admin = await store.update("users", existing["_id"], admin_data)
+    else:
+        try:
+            admin = await store.insert("users", admin_data)
+        except DuplicateKeyError as exc:
+            raise HTTPException(status_code=409, detail="An account already uses this email") from exc
+    await audit_admin(owner["sub"], "ADMIN_CREATED", "user", admin["_id"], {"email": email})
+    return public(admin) or {}
+
+
+@app.patch(f"{settings.api_prefix}/super-admin/admins/{{admin_id}}", dependencies=[Depends(verify_access_token)])
+async def super_admin_update_admin(admin_id: str, payload: AdminAccountUpdate, owner: dict[str, str] = Depends(require_roles("SUPER_ADMIN"))) -> dict[str, Any]:
+    admin = await store.find_one("users", {"_id": admin_id, "role": "ADMIN"})
+    if not admin or admin.get("status") == "DELETED":
+        raise HTTPException(status_code=404, detail="Admin account not found")
+    changes = payload.model_dump(exclude_none=True)
+    if "email" in changes:
+        changes["email"] = str(changes["email"]).lower()
+        duplicate = await store.find_one("users", {"email": changes["email"]})
+        if duplicate and duplicate["_id"] != admin_id:
+            raise HTTPException(status_code=409, detail="An account already uses this email")
+    password = changes.pop("password", None)
+    if password:
+        changes["password_hash"], changes["password_salt"] = hash_password(password)
+    try:
+        updated = await store.update("users", admin_id, changes)
+    except DuplicateKeyError as exc:
+        raise HTTPException(status_code=409, detail="An account already uses this email") from exc
+    await audit_admin(owner["sub"], "ADMIN_UPDATED", "user", admin_id, {key: value for key, value in changes.items() if key not in {"password_hash", "password_salt"}})
+    return public(updated) or {}
+
+
+@app.delete(f"{settings.api_prefix}/super-admin/admins/{{admin_id}}", dependencies=[Depends(verify_access_token)])
+async def super_admin_delete_admin(admin_id: str, owner: dict[str, str] = Depends(require_roles("SUPER_ADMIN"))) -> dict[str, bool]:
+    admin = await store.find_one("users", {"_id": admin_id, "role": "ADMIN"})
+    if not admin or admin.get("status") == "DELETED":
+        raise HTTPException(status_code=404, detail="Admin account not found")
+    await store.update("users", admin_id, {"status": "DELETED", "deleted_at": utcnow()})
+    await audit_admin(owner["sub"], "ADMIN_DELETED", "user", admin_id, {"email": admin.get("email")})
+    return {"deleted": True}
+
+
+@app.get(f"{settings.api_prefix}/super-admin/reports")
+async def super_admin_reports(_: dict[str, str] = Depends(require_roles("SUPER_ADMIN"))) -> dict[str, Any]:
+    fees = await store.find_many("service_fee_records", limit=10_000)
+    payments = await store.find_many("payments", limit=10_000)
+    admins = await store.find_many("users", {"role": "ADMIN"}, limit=10_000)
+    return {
+        "total_fees_generated": sum(int(item.get("calculated_service_fee", 0)) for item in fees),
+        "owner_earnings": sum(min(int(item.get("calculated_service_fee", 0)), int(item.get("amount_collected", 0))) for item in fees),
+        "total_amount_collected": sum(int(item.get("amount_paid", 0)) for item in payments if item.get("status") == "PAID"),
+        "successful_payments": sum(item.get("status") == "PAID" for item in payments),
+        "fee_records": len(fees),
+        "admin_count": sum(item.get("status") != "DELETED" for item in admins),
+    }
+
+
 @app.get(f"{settings.api_prefix}/admin/audit-logs")
 async def admin_audit_logs(_: dict[str, str] = Depends(require_roles("ADMIN"))) -> list[dict[str, Any]]:
     logs = await store.find_many("audit_logs", limit=1000)
@@ -1276,7 +1571,7 @@ async def driver_availability(payload: dict[str, str], driver: dict[str, str] = 
     profile = await store.find_one("drivers", {"user_id": driver["sub"]})
     if not profile:
         raise HTTPException(status_code=404, detail="Driver profile not found")
-    changes: dict[str, Any] = {"online_status": online_status, "last_seen": utcnow()}
+    changes: dict[str, Any] = {"online_status": online_status, "schedule_availability": "AVAILABLE" if online_status == "ONLINE" else "UNAVAILABLE", "last_seen": utcnow()}
     if online_status == "ONLINE":
         try:
             changes["latitude"] = float(payload["latitude"])

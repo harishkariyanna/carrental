@@ -4,10 +4,13 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
+VehicleType = Literal["SEDAN_CNG", "SEDAN_NON_CNG", "ERTIGA", "INNOVA", "INNOVA_CRYSTA", "TT"]
+
 
 class Role(StrEnum):
     CUSTOMER = "CUSTOMER"
     ADMIN = "ADMIN"
+    SUPER_ADMIN = "SUPER_ADMIN"
     DRIVER = "DRIVER"
 
 
@@ -94,7 +97,7 @@ class BookingCreate(BaseModel):
 class VehicleInput(BaseModel):
     name: str = Field(min_length=2, max_length=100)
     registration_number: str = Field(min_length=8, max_length=12, pattern=r"^[A-Za-z]{2}\d{2}[A-Za-z]{1,3}\d{4}$")
-    category: str
+    category: VehicleType
     seats: int = Field(ge=1, le=20)
     luggage: int = Field(ge=0, le=20)
     transmission: str
@@ -120,7 +123,7 @@ class VehicleInput(BaseModel):
     outstation_round_trip_day_rate_non_ac: int = Field(default=2700, ge=0)
     outstation_extra_km_rate_non_ac: int = Field(default=16, ge=0)
     image: str = ""
-    status: str = "AVAILABLE"
+    status: Literal["ACTIVE", "MAINTENANCE", "INACTIVE"] = "ACTIVE"
 
     @field_validator("registration_number")
     @classmethod
@@ -131,7 +134,7 @@ class VehicleInput(BaseModel):
 class VehicleUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=100)
     registration_number: str | None = Field(default=None, min_length=8, max_length=12, pattern=r"^[A-Za-z]{2}\d{2}[A-Za-z]{1,3}\d{4}$")
-    category: str | None = None
+    category: VehicleType | None = None
     seats: int | None = Field(default=None, ge=1, le=20)
     luggage: int | None = Field(default=None, ge=0, le=20)
     transmission: str | None = None
@@ -157,7 +160,7 @@ class VehicleUpdate(BaseModel):
     outstation_round_trip_day_rate_non_ac: int | None = Field(default=None, ge=0)
     outstation_extra_km_rate_non_ac: int | None = Field(default=None, ge=0)
     image: str | None = None
-    status: Literal["AVAILABLE", "BOOKED", "ON_TRIP", "MAINTENANCE", "INACTIVE"] | None = None
+    status: Literal["ACTIVE", "MAINTENANCE", "INACTIVE"] | None = None
 
     @field_validator("registration_number")
     @classmethod
@@ -204,7 +207,7 @@ class DriverUpdate(BaseModel):
 
 class PricingRuleInput(BaseModel):
     service_type: ServiceType
-    vehicle_category: str = Field(min_length=2, max_length=60)
+    vehicle_category: VehicleType
     base_fare: int = Field(ge=0)
     per_km: int = Field(ge=0)
     extra_hour: int = Field(ge=0)
@@ -271,6 +274,25 @@ class PlatformSettingsUpdate(BaseModel):
         if self.outstation_advance_type == "PERCENTAGE" and self.outstation_advance_value is not None and self.outstation_advance_value > 100:
             raise ValueError("Outstation advance percentage cannot exceed 100")
         return self
+
+
+class SuperAdminSettingsUpdate(BaseModel):
+    application_service_fee_percent: float = Field(ge=0, le=100)
+
+
+class AdminAccountCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=80)
+    email: EmailStr
+    phone: str = Field(min_length=10, max_length=16)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class AdminAccountUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=80)
+    email: EmailStr | None = None
+    phone: str | None = Field(default=None, min_length=10, max_length=16)
+    password: str | None = Field(default=None, min_length=8, max_length=128)
+    status: Literal["ACTIVE", "INACTIVE"] | None = None
 
 
 class DriverAssignment(BaseModel):

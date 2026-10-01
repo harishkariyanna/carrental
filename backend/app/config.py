@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     seed_demo_data: bool = True
     seed_admin_email: str = "admin@example.com"
     seed_admin_password: SecretStr = SecretStr("")
+    seed_super_admin_email: str = "owner@example.com"
+    seed_super_admin_password: SecretStr = SecretStr("")
     seed_customer_email: str = "ridex.customer@mailinator.com"
     seed_customer_password: SecretStr = SecretStr("")
     seed_driver_email: str = "ridex.driver@mailinator.com"
@@ -31,6 +33,7 @@ class Settings(BaseSettings):
     razorpay_key_id: str = ""
     razorpay_key_secret: str = ""
     razorpay_webhook_secret: str = ""
+    razorpay_api_url: str = "https://api.razorpay.com/v1"
     allow_test_payments: bool = False
 
     smtp_host: str = ""

@@ -7,11 +7,14 @@ os.environ["DEMO_MODE"] = "true"
 os.environ["SEED_DEMO_DATA"] = "true"
 os.environ["SEED_ADMIN_EMAIL"] = "admin@mailinator.com"
 os.environ["SEED_ADMIN_PASSWORD"] = "AdminTest@123"
+os.environ["SEED_SUPER_ADMIN_EMAIL"] = "owner@mailinator.com"
+os.environ["SEED_SUPER_ADMIN_PASSWORD"] = "OwnerTest@123"
 os.environ["SEED_CUSTOMER_EMAIL"] = "ridex.customer@mailinator.com"
 os.environ["SEED_CUSTOMER_PASSWORD"] = "Customer@123"
 os.environ["SEED_DRIVER_EMAIL"] = "ridex.driver@mailinator.com"
 os.environ["SEED_DRIVER_PASSWORD"] = "Driver@123"
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.main import app, payment_policy, store
@@ -20,6 +23,7 @@ from app.config import Settings, get_settings
 from app.security import hash_password, verify_password
 from app.services.pricing_service import calculate_vehicle_quote
 from app.services.email_service import EmailDeliveryService
+from app.services.google_review_refresh_service import GoogleReviewRefreshService
 
 
 def login(client: TestClient, email: str, password: str) -> str:
@@ -43,6 +47,37 @@ def test_public_documents_serialize_mongo_object_ids() -> None:
     document_id = ObjectId()
     result = public({"_id": document_id, "nested": {"reference": document_id}, "items": [document_id]})
     assert result == {"id": str(document_id), "nested": {"reference": str(document_id)}, "items": [str(document_id)]}
+
+
+def test_admin_can_manually_refresh_google_review_snapshot(monkeypatch) -> None:
+    place_data = r'''[null,[null,null,null,["https://search.google.com/local/reviews?placeid\u003dChIJiVvOuNwbrjsRDAOYVBwSl6M","4 reviews",null],null,null,null,4.8,4],"Konanur Tours and Travels","No. 87, Konanur Tours and Travels, Budigere, Bangalore, Karnataka 562129"]'''
+    parsed = GoogleReviewRefreshService.parse_place_data(place_data)
+    assert parsed["rating"] == 4.8
+    assert parsed["review_count"] == 4
+
+    async def fetched(_service):
+        return parsed
+
+    monkeypatch.setattr("app.main.GoogleReviewRefreshService.fetch", fetched)
+    with TestClient(app) as client:
+        login(client, "admin@mailinator.com", "AdminTest@123")
+        refreshed = client.post("/api/v1/admin/reviews/google/refresh")
+        assert refreshed.status_code == 200
+        assert refreshed.json()["rating"] == 4.8
+        assert refreshed.json()["review_count"] == 4
+        assert client.get("/api/v1/reviews/google").json()["review_count"] == 4
+
+        async def blocked(_service):
+            raise HTTPException(status_code=502, detail="Changed Google payload")
+
+        monkeypatch.setattr("app.main.GoogleReviewRefreshService.fetch", blocked)
+        unchanged = client.post("/api/v1/admin/reviews/google/refresh")
+        assert unchanged.status_code == 200
+        assert unchanged.json()["review_count"] == 4
+        assert "unchanged" in unchanged.json()["refresh_warning"]
+
+        login(client, "ridex.customer@mailinator.com", "Customer@123")
+        assert client.post("/api/v1/admin/reviews/google/refresh").status_code == 403
 
 
 def test_vehicle_specific_local_and_outstation_pricing() -> None:
@@ -99,7 +134,7 @@ def test_admin_can_update_and_archive_unused_vehicle() -> None:
     with TestClient(app) as client:
         login(client, "admin@mailinator.com", "AdminTest@123")
         assert client.delete("/api/v1/admin/vehicles/innova").status_code == 409
-        created = client.post("/api/v1/admin/vehicles", json={"name": "Archive Test Car", "registration_number": "ka09zz6784", "category": "Sedan", "seats": 4, "luggage": 2, "transmission": "Automatic", "fuel": "Petrol", "base_rate": 1000, "local_per_km": 21, "outstation_round_trip_day_rate": 3500})
+        created = client.post("/api/v1/admin/vehicles", json={"name": "Archive Test Car", "registration_number": "ka09zz6784", "category": "SEDAN_NON_CNG", "seats": 4, "luggage": 2, "transmission": "Automatic", "fuel": "Petrol", "base_rate": 1000, "local_per_km": 21, "outstation_round_trip_day_rate": 3500})
         assert created.status_code == 201
         assert created.json()["registration_number"] == "KA09ZZ6784"
         vehicle_id = created.json()["id"]
@@ -171,7 +206,7 @@ def test_coupon_minimum_does_not_hide_ineligible_cars() -> None:
         response = client.post("/api/v1/quotes", json={"service_type": "AIRPORT", "pickup": "Whitefield", "destination": "BLR Airport", "scheduled_at": "2027-02-01T10:00:00+05:30", "passengers": 2, "luggage": 1, "coupon_code": "MIXEDFARE"})
         assert response.status_code == 200
         body = response.json()
-        assert len(body["results"]) == 4
+        assert len(body["results"]) == 6
         assert any(item["pricing"].get("coupon") for item in body["results"])
         assert any(item["pricing"].get("coupon_ineligible_reason") for item in body["results"])
         assert body["coupon_message"].startswith("Coupon requires a minimum fare")
@@ -205,7 +240,8 @@ def test_health_and_catalog() -> None:
         assert client.get("/health").json()["status"] == "ok"
         vehicles = client.get("/api/v1/vehicles")
         assert vehicles.status_code == 200
-        assert len(vehicles.json()) == 4
+        assert len(vehicles.json()) == 6
+        assert {item["category"] for item in vehicles.json()} == {"SEDAN_CNG", "SEDAN_NON_CNG", "ERTIGA", "INNOVA", "INNOVA_CRYSTA", "TT"}
 
 
 def test_driver_registration_creates_pending_profile() -> None:
@@ -317,6 +353,72 @@ def test_advance_upi_qr_payment_is_persisted_and_idempotent() -> None:
         assert preview.json() == {"amount": 25, "remaining": 75, "booking_total": 100, "payment_type": "ADVANCE_PERCENTAGE"}
 
 
+def test_super_admin_fee_uses_total_bill_not_advance() -> None:
+    with TestClient(app) as client:
+        login(client, "admin@mailinator.com", "AdminTest@123")
+        assert client.patch("/api/v1/super-admin/settings", json={"application_service_fee_percent": 2}).status_code == 403
+
+        login(client, "owner@mailinator.com", "OwnerTest@123")
+        configured = client.patch("/api/v1/super-admin/settings", json={"application_service_fee_percent": 2})
+        assert configured.status_code == 200
+        assert configured.json()["application_service_fee_percent"] == 2
+
+        booking = next(item for item in store.memory["bookings"] if item["_id"] == "booking-demo")
+        booking.update({"total": 10_000, "paid_amount": 0, "payment_status": "PENDING", "status": "PENDING_PAYMENT"})
+        payment = store.memory["payments"]
+        payment.clear()
+
+        login(client, "ridex.customer@mailinator.com", "Customer@123")
+        order = client.post("/api/v1/bookings/booking-demo/payment-order").json()
+        stored = next(item for item in store.memory["payments"] if item["_id"] == order["id"])
+        stored["amount"] = 3_000
+        confirmed = client.post(f"/api/v1/payments/{order['id']}/demo-confirm")
+        assert confirmed.status_code == 200
+
+        history = client.get("/api/v1/customer/payments")
+        assert history.status_code == 200
+        assert any(item["id"] == order["id"] and item["upi_transaction_id"].startswith("DEMO_TXN_") for item in history.json())
+
+        fee = next(item for item in store.memory["service_fee_records"] if item["payment_id"] == order["id"])
+        assert fee["total_booking_amount"] == 10_000
+        assert fee["amount_collected"] == 3_000
+        assert fee["configured_percentage"] == 2
+        assert fee["calculated_service_fee"] == 200
+
+
+def test_super_admin_can_manage_normal_admin_accounts() -> None:
+    with TestClient(app) as client:
+        login(client, "admin@mailinator.com", "AdminTest@123")
+        assert client.get("/api/v1/super-admin/admins").status_code == 403
+
+        login(client, "owner@mailinator.com", "OwnerTest@123")
+        initial = client.get("/api/v1/super-admin/admins")
+        assert initial.status_code == 200
+        assert any(admin["id"] == "admin-demo" for admin in initial.json())
+
+        created = client.post("/api/v1/super-admin/admins", json={"name": "Operations Admin", "email": "operations.admin@mailinator.com", "phone": "+919811110000", "password": "Operations@123"})
+        assert created.status_code == 201
+        admin_id = created.json()["id"]
+        assert created.json()["role"] == "ADMIN"
+        assert "password_hash" not in created.json()
+
+        duplicate = client.post("/api/v1/super-admin/admins", json={"name": "Duplicate Admin", "email": "operations.admin@mailinator.com", "phone": "+919811110001", "password": "Operations@123"})
+        assert duplicate.status_code == 409
+
+        updated = client.patch(f"/api/v1/super-admin/admins/{admin_id}", json={"name": "Senior Operations Admin", "phone": "+919811110002", "password": "NewOperations@123", "status": "ACTIVE"})
+        assert updated.status_code == 200
+        assert updated.json()["name"] == "Senior Operations Admin"
+
+        report = client.get("/api/v1/super-admin/reports")
+        assert report.status_code == 200
+        assert report.json()["admin_count"] == 2
+        assert "owner_earnings" in report.json()
+
+        deleted = client.delete(f"/api/v1/super-admin/admins/{admin_id}")
+        assert deleted.status_code == 200
+        assert all(admin["id"] != admin_id for admin in client.get("/api/v1/super-admin/admins").json())
+
+
 def test_role_boundaries_and_driver_transition() -> None:
     with TestClient(app) as client:
         login(client, "ridex.customer@mailinator.com", "Customer@123")
@@ -377,15 +479,20 @@ def test_vehicle_default_driver_auto_assignment_and_schedule_aware_reassignment(
         assert default_assignment.status_code == 200
         default_profile = next(item for item in store.memory["drivers"] if item["user_id"] == "driver-demo")
         assert default_profile["online_status"] == "OFFLINE"
-        assert default_profile["schedule_availability"] == "AVAILABLE"
+        assert default_profile["schedule_availability"] == "UNAVAILABLE"
+        login(client, "ridex.driver@mailinator.com", "Driver@123")
+        assert client.patch("/api/v1/driver/availability", json={"online_status": "ONLINE", "latitude": "12.971599", "longitude": "77.594566"}).status_code == 200
+        client.headers["Authorization"] = f"Bearer {admin_token}"
 
         second_driver = client.post("/api/v1/admin/drivers", json={"name": "Available Driver", "email": "available.driver@mailinator.com", "phone": "+919844445555", "password": "Available@123", "license_number": "KA02-2026-5555", "license_expiry": "2030-12-31"})
         assert second_driver.status_code == 201
         second_driver_id = second_driver.json()["id"]
         second_profile = next(item for item in store.memory["drivers"] if item["user_id"] == second_driver_id)
         second_profile["documents_status"] = "SUBMITTED"
-        approved = client.patch(f"/api/v1/admin/drivers/{second_driver_id}", json={"verification_status": "VERIFIED", "schedule_availability": "AVAILABLE"})
+        approved = client.patch(f"/api/v1/admin/drivers/{second_driver_id}", json={"verification_status": "VERIFIED"})
         assert approved.status_code == 200
+        login(client, "available.driver@mailinator.com", "Available@123")
+        assert client.patch("/api/v1/driver/availability", json={"online_status": "ONLINE", "latitude": "12.960000", "longitude": "77.600000"}).status_code == 200
 
         customer_token = login(client, "ridex.customer@mailinator.com", "Customer@123")
         quote = client.post("/api/v1/quotes", json={"service_type": "AIRPORT", "pickup": "Whitefield", "destination": "BLR Airport", "scheduled_at": "2027-01-10T10:00:00+05:30", "passengers": 2, "luggage": 1}).json()["results"]
@@ -398,6 +505,15 @@ def test_vehicle_default_driver_auto_assignment_and_schedule_aware_reassignment(
         assert confirmed.json()["driver_id"] == "driver-demo"
         assert confirmed.json()["assignment_status"] == "AUTO_ASSIGNED"
         assert any(item["booking_id"] == booking["id"] and item["driver_id"] == "driver-demo" for item in store.memory["driver_reservations"])
+
+        overlapping = client.post("/api/v1/quotes", json={"service_type": "AIRPORT", "pickup": "Whitefield", "destination": "BLR Airport", "scheduled_at": "2027-01-10T10:00:00+05:30", "passengers": 2, "luggage": 1}).json()["results"]
+        assert all(item["vehicle"]["id"] != "city" for item in overlapping)
+        client.headers["Authorization"] = f"Bearer {admin_token}"
+        friend_vehicle = client.post("/api/v1/admin/vehicles", json={"name": "Friend Sedan", "registration_number": "KA06FS2026", "category": "SEDAN_NON_CNG", "seats": 4, "luggage": 2, "transmission": "Manual", "fuel": "Petrol", "has_ac": True, "base_rate": 1200, "status": "ACTIVE"})
+        assert friend_vehicle.status_code == 201
+        client.headers["Authorization"] = f"Bearer {customer_token}"
+        expanded_capacity = client.post("/api/v1/quotes", json={"service_type": "AIRPORT", "pickup": "Whitefield", "destination": "BLR Airport", "scheduled_at": "2027-01-10T10:00:00+05:30", "passengers": 2, "luggage": 1}).json()["results"]
+        assert any(item["vehicle"]["id"] == friend_vehicle.json()["id"] for item in expanded_capacity)
 
         client.headers["Authorization"] = f"Bearer {admin_token}"
         available = client.get(f"/api/v1/admin/bookings/{booking['id']}/available-drivers")
@@ -593,7 +709,7 @@ def test_complete_admin_api_is_database_backed() -> None:
         verified = client.patch(f"/api/v1/admin/drivers/{driver_id}", headers=headers, json={"verification_status": "VERIFIED", "availability": "AVAILABLE"})
         assert verified.json()["profile"]["verification_status"] == "VERIFIED"
 
-        vehicle = client.post("/api/v1/admin/vehicles", headers=headers, json={"name": "Test Sedan", "registration_number": "KA10TT1234", "category": "Sedan", "seats": 4, "luggage": 2, "transmission": "Automatic", "fuel": "Petrol", "has_ac": True, "base_rate": 1200, "image": "https://example.com/car.jpg", "status": "AVAILABLE"})
+        vehicle = client.post("/api/v1/admin/vehicles", headers=headers, json={"name": "Test Sedan", "registration_number": "KA10TT1234", "category": "SEDAN_NON_CNG", "seats": 4, "luggage": 2, "transmission": "Automatic", "fuel": "Petrol", "has_ac": True, "base_rate": 1200, "image": "https://example.com/car.jpg", "status": "ACTIVE"})
         assert vehicle.status_code == 201
         vehicle_id = vehicle.json()["id"]
         maintenance = client.patch(f"/api/v1/admin/vehicles/{vehicle_id}", headers=headers, json={"status": "MAINTENANCE"})
@@ -609,8 +725,17 @@ def test_complete_admin_api_is_database_backed() -> None:
         bookings = client.get("/api/v1/admin/bookings").json()
         assert bookings[0]["customer"]["role"] == "CUSTOMER"
         assert bookings[0]["vehicle"]["name"]
+        today = datetime.now(UTC).date()
+        calendar = client.get(f"/api/v1/admin/bookings/calendar?start={today.isoformat()}&end={(today + timedelta(days=31)).isoformat()}")
+        assert calendar.status_code == 200
+        calendar_booking = next(item for item in calendar.json()["bookings"] if item["id"] == "booking-demo")
+        assert calendar_booking["vehicle"]["name"]
+        assert calendar_booking["driver"]["name"]
+        assert calendar_booking["pickup"]
+        assert calendar_booking["destination"]
+        assert client.get(f"/api/v1/admin/bookings/calendar?start={today.isoformat()}&end={(today + timedelta(days=90)).isoformat()}").status_code == 422
 
-        rule = client.post("/api/v1/admin/pricing-rules", headers=headers, json={"service_type": "NORMAL", "vehicle_category": "Sedan", "base_fare": 500, "per_km": 18, "extra_hour": 200, "driver_allowance": 0, "tax_percent": 5, "status": "DRAFT"})
+        rule = client.post("/api/v1/admin/pricing-rules", headers=headers, json={"service_type": "NORMAL", "vehicle_category": "SEDAN_NON_CNG", "base_fare": 500, "per_km": 18, "extra_hour": 200, "driver_allowance": 0, "tax_percent": 5, "status": "DRAFT"})
         assert rule.status_code == 201
         rule_body = rule.json()
         rule_body["status"] = "ACTIVE"
@@ -621,8 +746,10 @@ def test_complete_admin_api_is_database_backed() -> None:
         assert coupon.status_code == 201
 
         store.memory["reviews"].append({"_id": "review-admin-test", "booking_id": "booking-demo", "customer_id": "customer-demo", "rating": 5, "comment": "Great ride", "status": "PUBLISHED", "created_at": "2026-09-26T00:00:00Z"})
+        assert any(item["id"] == "review-admin-test" for item in client.get("/api/v1/reviews").json())
         review = client.patch("/api/v1/admin/reviews/review-admin-test", headers=headers, json={"status": "HIDDEN", "reason": "Moderated in test"})
         assert review.json()["status"] == "HIDDEN"
+        assert all(item["id"] != "review-admin-test" for item in client.get("/api/v1/reviews").json())
 
         settings_response = client.patch("/api/v1/admin/settings", headers=headers, json={"support_phone": "+91 9000000000", "cancellation_hours": 4})
         assert settings_response.json()["cancellation_hours"] == 4
@@ -635,7 +762,7 @@ def test_admin_pricing_change_controls_customer_quote() -> None:
     with TestClient(app) as client:
         admin_csrf = login(client, "admin@mailinator.com", "AdminTest@123")
         rules = client.get("/api/v1/admin/pricing-rules").json()
-        rule = next(item for item in rules if item["service_type"] == "AIRPORT" and item["vehicle_category"] == "7 Seater")
+        rule = next(item for item in rules if item["service_type"] == "AIRPORT" and item["vehicle_category"] == "INNOVA")
         changed = {**rule, "base_fare": 7000, "driver_allowance": 0, "tax_percent": 5, "status": "ACTIVE"}
         response = client.patch(f"/api/v1/admin/pricing-rules/{rule['id']}", headers={"X-CSRF-Token": admin_csrf}, json=changed)
         assert response.status_code == 200
@@ -693,7 +820,7 @@ def test_driver_online_status_requires_and_stores_location() -> None:
         offline = client.patch("/api/v1/driver/availability", json={"online_status": "OFFLINE"})
         assert offline.status_code == 200
         assert offline.json()["online_status"] == "OFFLINE"
-        assert offline.json()["schedule_availability"] == "AVAILABLE"
+        assert offline.json()["schedule_availability"] == "UNAVAILABLE"
 
 
 def test_media_blob_and_trip_otp_extra_completion_workflow() -> None:
@@ -707,8 +834,10 @@ def test_media_blob_and_trip_otp_extra_completion_workflow() -> None:
         media = client.get(upload.json()["url"])
         assert media.status_code == 200
         assert media.content.startswith(b"\x89PNG")
-        vehicle = client.get("/api/v1/admin/vehicles").json()[0]
+        vehicle = next(item for item in client.get("/api/v1/admin/vehicles").json() if item["id"] == "innova")
         assert upload.json()["id"] in vehicle.get("image_ids", [])
+        assert "future_booking_count" in vehicle
+        assert "next_booking_at" in vehicle
 
         driver_token = login(client, "ridex.driver@mailinator.com", "Driver@123")
         booking_id = "booking-demo"

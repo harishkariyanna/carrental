@@ -4,7 +4,8 @@ sessionStorage.removeItem('ridex_csrf')
 sessionStorage.removeItem('ridex_draft')
 document.cookie = 'ridex_csrf=; Max-Age=0; path=/'
 
-export type Role = 'CUSTOMER' | 'ADMIN' | 'DRIVER'
+export type Role = 'CUSTOMER' | 'ADMIN' | 'SUPER_ADMIN' | 'DRIVER'
+export type VehicleType = 'SEDAN_CNG' | 'SEDAN_NON_CNG' | 'SUV' | 'ERTIGA' | 'INNOVA' | 'INNOVA_CRYSTA' | 'TT'
 
 export interface User {
   id: string
@@ -28,7 +29,7 @@ export interface Vehicle {
   id: string
   name: string
   registration_number: string
-  category: string
+  category: VehicleType
   seats: number
   luggage: number
   transmission: string
@@ -55,7 +56,7 @@ export interface Vehicle {
   outstation_round_trip_day_rate_non_ac: number
   outstation_extra_km_rate_non_ac: number
   image: string
-  status: string
+  status: 'ACTIVE' | 'MAINTENANCE' | 'INACTIVE'
   amenities: string[]
 }
 

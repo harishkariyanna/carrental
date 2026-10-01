@@ -1,11 +1,32 @@
 import { useEffect, useState } from 'react'
 import L from 'leaflet'
-import { MapPin, Navigation, X } from 'lucide-react'
+import { ChevronRight, MapPin, Navigation, X } from 'lucide-react'
 import { MapContainer, Marker, Polyline, TileLayer, useMap, useMapEvents } from 'react-leaflet'
 import 'leaflet/dist/leaflet.css'
 import { api } from '../../api'
 
 export interface MapPoint { latitude: number; longitude: number; label?: string }
+
+const coordinateLabel = /^\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*$/
+
+export function LocationPickerField({ label, value, onClick }: { label: string; value: string; onClick: () => void }) {
+  return <button type="button" className="location-picker-field" onClick={onClick}><span>{label}</span><div><MapPin/><strong className={value ? '' : 'placeholder'}>{value || 'Choose a location on the map'}</strong><ChevronRight/></div></button>
+}
+
+export function ResolvedAddress({ label, latitude, longitude }: { label: string; latitude?: number; longitude?: number }) {
+  const lookupKey = `${latitude ?? ''},${longitude ?? ''}`
+  const needsLookup = latitude != null && longitude != null && (!label || coordinateLabel.test(label))
+  const [resolved, setResolved] = useState({ key: '', address: '' })
+  useEffect(() => {
+    if (!needsLookup || latitude == null || longitude == null) return
+    let cancelled = false
+    const params = new URLSearchParams({ latitude: String(latitude), longitude: String(longitude) })
+    void api<{ label: string }>(`/maps/reverse?${params}`).then((result) => { if (!cancelled) setResolved({ key: lookupKey, address: result.label }) }).catch(() => undefined)
+    return () => { cancelled = true }
+  }, [latitude, longitude, lookupKey, needsLookup])
+  const address = needsLookup && resolved.key === lookupKey ? resolved.address : label
+  return <>{address || 'Finding nearest address...'}</>
+}
 
 const marker = (color: string) => L.divIcon({ className: '', html: `<span style="display:block;width:18px;height:18px;border:4px solid white;border-radius:50%;background:${color};box-shadow:0 2px 8px #243b5a66"></span>`, iconAnchor: [9, 9] })
 

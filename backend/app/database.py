@@ -61,6 +61,7 @@ class Store:
         if self.settings.demo_mode:
             self.memory = {name: [] for name in self.collection_names}
             await self.seed()
+            await self._migrate_legacy_fleet()
             return
         self.client = AsyncMongoClient(self.settings.mongodb_uri)
         self.db = self.client[self.settings.mongodb_database]
@@ -69,6 +70,7 @@ class Store:
         await self.bootstrap_admin()
         if self.settings.seed_demo_data:
             await self.seed()
+        await self._migrate_legacy_fleet()
 
     async def close(self) -> None:
         if self.client:
@@ -81,6 +83,8 @@ class Store:
             "notifications", "reviews", "trip_events", "audit_logs",
             "support_requests", "vehicle_reservations", "driver_reservations", "payment_webhook_events",
             "password_reset_otps", "pricing_rules", "coupons", "coupon_redemptions", "platform_settings",
+            "service_fee_settings", "service_fee_records",
+            "google_review_snapshots",
             "saved_locations",
             "media_blobs", "trip_otps", "trip_extras", "email_outbox",
         )
@@ -98,6 +102,8 @@ class Store:
         await self.db.driver_reservations.create_index("driver_id")
         await self.db.driver_reservations.create_index("expires_at", expireAfterSeconds=0)
         await self.db.payment_webhook_events.create_index("provider_event_id", unique=True)
+        await self.db.service_fee_records.create_index("payment_id", unique=True)
+        await self.db.service_fee_records.create_index("booking_id")
         await self.db.password_reset_otps.create_index("expires_at", expireAfterSeconds=0)
         await self.db.coupons.create_index("code", unique=True)
         await self.db.coupon_redemptions.create_index([("coupon_id", ASCENDING), ("customer_id", ASCENDING)], unique=True)
@@ -109,6 +115,29 @@ class Store:
         await self.db.trip_extras.create_index("booking_id")
         await self.db.email_outbox.create_index([("status", ASCENDING), ("created_at", ASCENDING)])
         await self.db.email_outbox.create_index([("user_id", ASCENDING), ("created_at", ASCENDING)])
+
+    async def _migrate_legacy_fleet(self) -> None:
+        await self.update_many("vehicles", {"status": {"$in": ["AVAILABLE", "BOOKED", "ON_TRIP"]}}, {"status": "ACTIVE"})
+        supported = {"SEDAN_CNG", "SEDAN_NON_CNG", "SUV", "ERTIGA", "INNOVA", "INNOVA_CRYSTA", "TT"}
+        for vehicle in await self.find_many("vehicles", limit=10_000):
+            if vehicle.get("category") in supported:
+                continue
+            name = str(vehicle.get("name", "")).upper()
+            category = str(vehicle.get("category", "")).upper()
+            fuel = str(vehicle.get("fuel", "")).upper()
+            if "SEDAN" in category:
+                normalized = "SEDAN_CNG" if fuel == "CNG" else "SEDAN_NON_CNG"
+            elif "CRYSTA" in name:
+                normalized = "INNOVA_CRYSTA"
+            elif "INNOVA" in name or "7 SEATER" in category:
+                normalized = "INNOVA"
+            elif "ERTIGA" in name:
+                normalized = "ERTIGA"
+            elif "TRAVELLER" in name or category == "TT":
+                normalized = "TT"
+            else:
+                normalized = "SUV"
+            await self.update("vehicles", vehicle["_id"], {"category": normalized})
 
     async def find_one(self, collection: str, query: dict[str, Any]) -> dict[str, Any] | None:
         if self.settings.demo_mode:
@@ -185,20 +214,23 @@ class Store:
         await self._ensure_seed_user("customer-demo", "Harish Kumar", self.settings.seed_customer_email, "+919876543210", "CUSTOMER", self.settings.seed_customer_password.get_secret_value())
         await self._ensure_seed_user("driver-demo", "Raj Kumar", self.settings.seed_driver_email, "+919800000002", "DRIVER", self.settings.seed_driver_password.get_secret_value())
         if not await self.find_one("drivers", {"_id": "driver-profile-demo"}):
-            await self.insert("drivers", {"_id": "driver-profile-demo", "user_id": "driver-demo", "schedule_availability": "AVAILABLE", "online_status": "OFFLINE", "verification_status": "VERIFIED", "documents_status": "APPROVED", "rating": 4.8, "earnings": 18400, "license_expiry": "2028-12-31"})
+            await self.insert("drivers", {"_id": "driver-profile-demo", "user_id": "driver-demo", "schedule_availability": "UNAVAILABLE", "online_status": "OFFLINE", "verification_status": "VERIFIED", "documents_status": "APPROVED", "rating": 4.8, "earnings": 18400, "license_expiry": "2028-12-31"})
         else:
             profile = await self.find_one("drivers", {"_id": "driver-profile-demo"})
             if profile and not profile.get("verification_status"):
                 await self.update("drivers", profile["_id"], {"verification_status": "VERIFIED", "documents_status": "APPROVED"})
         if not await self.count("vehicles"):
             vehicles = [
-                {"_id": "innova", "name": "Toyota Innova Crysta", "registration_number": "KA02KK6784", "category": "7 Seater", "seats": 7, "luggage": 4, "transmission": "Automatic", "fuel": "Diesel", "has_ac": True, "rating": 4.8, "base_rate": 1799, "image": VEHICLE_IMAGES["innova"], "status": "AVAILABLE", "amenities": ["Spacious", "Charging", "Large boot"]},
-                {"_id": "city", "name": "Honda City", "registration_number": "KA01AB1234", "category": "Sedan", "seats": 4, "luggage": 2, "transmission": "Automatic", "fuel": "Petrol", "has_ac": True, "rating": 4.7, "base_rate": 1199, "image": VEHICLE_IMAGES["city"], "status": "AVAILABLE", "amenities": ["Comfort seats", "Music system"]},
-                {"_id": "creta", "name": "Hyundai Creta", "registration_number": "KA03MN4587", "category": "SUV", "seats": 5, "luggage": 3, "transmission": "Automatic", "fuel": "Diesel", "has_ac": True, "rating": 4.6, "base_rate": 1399, "image": VEHICLE_IMAGES["creta"], "status": "AVAILABLE", "amenities": ["Charging", "Rear AC"]},
-                {"_id": "fortuner", "name": "Toyota Fortuner", "registration_number": "KA05PX9001", "category": "Premium", "seats": 7, "luggage": 4, "transmission": "Automatic", "fuel": "Diesel", "has_ac": True, "rating": 4.9, "base_rate": 2499, "image": VEHICLE_IMAGES["fortuner"], "status": "AVAILABLE", "amenities": ["Premium interior", "Extra space"]},
+                {"_id": "sedan-cng", "name": "Sedan CNG", "registration_number": "KA01CG1234", "category": "SEDAN_CNG", "seats": 4, "luggage": 2, "transmission": "Manual", "fuel": "CNG", "has_ac": True, "rating": 4.7, "base_rate": 1099, "image": VEHICLE_IMAGES["city"], "status": "ACTIVE", "amenities": ["Efficient", "Comfort seats"]},
+                {"_id": "city", "name": "Sedan without CNG", "registration_number": "KA01AB1234", "category": "SEDAN_NON_CNG", "seats": 4, "luggage": 2, "transmission": "Automatic", "fuel": "Petrol", "has_ac": True, "rating": 4.7, "base_rate": 1199, "image": VEHICLE_IMAGES["city"], "status": "ACTIVE", "amenities": ["Comfort seats", "Music system"]},
+                {"_id": "ertiga", "name": "Maruti Suzuki Ertiga", "registration_number": "KA04ER2026", "category": "ERTIGA", "seats": 7, "luggage": 3, "transmission": "Manual", "fuel": "Petrol", "has_ac": True, "rating": 4.7, "base_rate": 1599, "image": VEHICLE_IMAGES["creta"], "status": "ACTIVE", "amenities": ["Third row", "Rear AC"]},
+                {"_id": "innova", "name": "Toyota Innova", "registration_number": "KA02KK6784", "category": "INNOVA", "seats": 7, "luggage": 4, "transmission": "Manual", "fuel": "Diesel", "has_ac": True, "rating": 4.8, "base_rate": 1799, "image": VEHICLE_IMAGES["innova"], "status": "ACTIVE", "amenities": ["Spacious", "Charging", "Large boot"]},
+                {"_id": "innova-crysta", "name": "Toyota Innova Crysta", "registration_number": "KA02IC2026", "category": "INNOVA_CRYSTA", "seats": 7, "luggage": 4, "transmission": "Automatic", "fuel": "Diesel", "has_ac": True, "rating": 4.9, "base_rate": 2099, "image": VEHICLE_IMAGES["innova"], "status": "ACTIVE", "amenities": ["Premium seats", "Charging", "Large boot"]},
+                {"_id": "tt", "name": "Force Traveller", "registration_number": "KA05TT2026", "category": "TT", "seats": 12, "luggage": 8, "transmission": "Manual", "fuel": "Diesel", "has_ac": True, "rating": 4.7, "base_rate": 2999, "image": VEHICLE_IMAGES["fortuner"], "status": "ACTIVE", "amenities": ["Group travel", "Large luggage bay"]},
             ]
             for vehicle in vehicles:
                 await self.insert("vehicles", vehicle)
+        await self.update_many("vehicles", {"status": {"$in": ["AVAILABLE", "BOOKED", "ON_TRIP"]}}, {"status": "ACTIVE"})
         if not await self.find_one("bookings", {"_id": "booking-demo"}):
             await self.insert("bookings", {
                 "_id": "booking-demo",
@@ -220,6 +252,8 @@ class Store:
             })
         if not await self.find_one("platform_settings", {"_id": "global"}):
             await self.insert("platform_settings", {"_id": "global", "platform_name": "RideX", "support_email": self.settings.smtp_from_email, "support_phone": "+91 800 123 4567", "cancellation_hours": 2, "cancellation_fee_percent": 0, "google_review_url": "https://www.google.com/maps", "maintenance_mode": False, "upi_id": "ridex@upi", "standard_advance_type": "PERCENTAGE", "standard_advance_value": 25, "airport_advance_type": "PERCENTAGE", "airport_advance_value": 25, "outstation_advance_type": "PERCENTAGE", "outstation_advance_value": 30})
+        if not await self.find_one("service_fee_settings", {"_id": "current"}):
+            await self.insert("service_fee_settings", {"_id": "current", "application_service_fee_percent": 2, "effective_at": utcnow(), "configured_by": "super-admin-demo"})
         if not await self.count("pricing_rules"):
             multipliers = {"NORMAL": 1, "AIRPORT": 1.25, "HOURLY": 1, "OUTSTATION": 1.9}
             for vehicle in await self.find_many("vehicles"):
@@ -228,6 +262,7 @@ class Store:
 
     async def bootstrap_admin(self) -> None:
         await self._ensure_seed_user("admin-demo", "Harish K", self.settings.seed_admin_email, "+919800000001", "ADMIN", self.settings.seed_admin_password.get_secret_value())
+        await self._ensure_seed_user("super-admin-demo", "RideX Owner", self.settings.seed_super_admin_email, "+919800000000", "SUPER_ADMIN", self.settings.seed_super_admin_password.get_secret_value())
 
     async def _ensure_seed_user(self, user_id: str, name: str, email: str, phone: str, role: str, password: str) -> None:
         if not password:

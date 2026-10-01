@@ -1,4 +1,5 @@
 import { type FormEvent, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { ArrowRight, CarFront, FileCheck2, MapPin, ShieldCheck, UserRound, X } from 'lucide-react'
 import { api, apiUpload, setJwt, type Role, type User, userFromJwt } from '../../api'
 
@@ -13,7 +14,7 @@ export function LoginModal({ open, initialMode = 'login', onClose, onAuthenticat
   const [mode, setMode] = useState(initialMode)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
-  const [registration, setRegistration] = useState({ name: '', email: '', phone: '', password: '', role: 'CUSTOMER' as Exclude<Role, 'ADMIN'>, license_number: '', license_expiry: '' })
+  const [registration, setRegistration] = useState({ name: '', email: '', phone: '', password: '', role: 'CUSTOMER' as Exclude<Role, 'ADMIN' | 'SUPER_ADMIN'>, license_number: '', license_expiry: '' })
   const [registeredDriver, setRegisteredDriver] = useState<User | null>(null)
   const [documents, setDocuments] = useState<{ license: File | null; address: File | null; vehicles: File[] }>({ license: null, address: null, vehicles: [] })
   const [busy, setBusy] = useState(false)
@@ -75,6 +76,7 @@ export function LoginModal({ open, initialMode = 'login', onClose, onAuthenticat
       <form onSubmit={login}>
         <label className="field"><span>Email address</span><div><UserRound /><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} required autoFocus /></div></label>
         <label className="field"><span>Password</span><div><ShieldCheck /><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} required /></div></label>
+        <Link className="forgot-link modal-forgot" to="/forgot-password" onClick={onClose}>Forgot password?</Link>
         {error && <div className="error-state"><ShieldCheck /><div><strong>Unable to sign in</strong><p>{error}</p></div></div>}
         <button className="button wide" disabled={busy}>{busy?'Signing in...':'Sign in'} <ArrowRight /></button>
       </form>
