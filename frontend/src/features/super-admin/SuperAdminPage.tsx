@@ -92,7 +92,7 @@ export function SuperAdminPage() {
   }
   const logout = () => { setJwt(null); window.location.href = '/login' }
   return <main className="owner-shell">
-    <aside className="owner-sidebar"><div><ShieldCheck/><strong>RideX Owner</strong><small>Super Admin</small></div><nav><a href="#overview"><CircleDollarSign/> Overview</a><a href="#admins"><UsersRound/> Admin Accounts</a><a href="#configuration"><Percent/> Fee Configuration</a><a href="#records"><ReceiptText/> Fee Records</a></nav><button className="admin-logout" onClick={logout}><LogOut/> Sign out</button></aside>
+    <aside className="owner-sidebar"><div><ShieldCheck/><strong>RideX Owner</strong><small>Super Admin</small></div><nav><a href="#overview"><CircleDollarSign/> Overview</a><a href="#admins"><UsersRound/> Admin Accounts</a><a href="#configuration"><Percent/> Fee Configuration</a><a href="#records"><ReceiptText/> Fee Records</a></nav><button className="admin-logout owner-logout" onClick={logout}><LogOut/> Sign out</button></aside>
     <section className="owner-main">
       <header><div><p className="eyebrow">APPLICATION OWNER</p><h1>Service Fee Control</h1><p>Configure and audit the platform fee independently from rental operations.</p></div><span className="owner-status">Owner access</span></header>
       {message&&<div className="admin-notice"><CheckCircle2/> {message}</div>}{error&&<div className="error-state"><ShieldCheck/><div><strong>Unable to load owner data</strong><p>{error}</p></div></div>}

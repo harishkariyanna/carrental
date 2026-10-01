@@ -308,7 +308,10 @@ body {
 .owner-sidebar nav a { display: flex; align-items: center; gap: 10px; min-height: 42px; padding: 0 11px; border-radius: 5px; color: #d9e5dc; text-decoration: none; font-size: 11px; font-weight: 700; }
 .owner-sidebar nav a:hover { background: #24382b; color: white; }
 .owner-sidebar nav svg { width: 17px; }
-.owner-sidebar .admin-logout { margin-top: auto; color: white; }
+.owner-sidebar .owner-logout { width: 100%; min-height: 44px; display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: auto; padding: 0 12px; border: 1px solid #557060; background: #24382b; color: white; box-shadow: none; font-weight: 800; cursor: pointer; }
+.owner-sidebar .owner-logout:hover { border-color: #e06a72; background: #a93642; color: white; }
+.owner-sidebar .owner-logout:focus-visible { outline: 3px solid rgba(117, 212, 154, .45); outline-offset: 2px; }
+.owner-sidebar .owner-logout svg { width: 17px; height: 17px; }
 .owner-main { min-width: 0; padding: 34px clamp(18px, 4vw, 52px) 70px; }
 .owner-main > header { display: flex; justify-content: space-between; gap: 20px; margin-bottom: 28px; }
 .owner-main > header h1 { margin: 3px 0 7px; font-family: Georgia, serif; font-size: 36px; letter-spacing: 0; }
@@ -327,7 +330,8 @@ body {
 .percent-input { position: relative; }
 .percent-input input { width: 100%; min-height: 48px; padding: 0 44px 0 13px; border: 1px solid #aebdb2; border-radius: 5px; background: white; font-size: 18px; font-weight: 800; }
 .percent-input svg { position: absolute; right: 13px; top: 14px; width: 18px; color: #348553; }
-.owner-records { border-radius: 6px; }
+.owner-records { min-width: 0; max-width: 100%; overflow: hidden; border-radius: 6px; }
+.owner-records .table-scroll { max-width: 100%; overflow-x: auto; }
 .owner-admin-section { min-width: 0; margin: 42px 0; scroll-margin-top: 20px; }
 .owner-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
 .owner-section-heading h2 { margin: 3px 0 7px; font-family: Georgia, serif; font-size: 26px; }
@@ -369,7 +373,7 @@ body {
   .owner-shell { grid-template-columns: 1fr; }
   .owner-sidebar { position: static; height: auto; padding: 14px; }
   .owner-sidebar nav { grid-template-columns: repeat(3, 1fr); margin-top: 12px; }
-  .owner-sidebar .admin-logout { position: absolute; top: 17px; right: 14px; }
+  .owner-sidebar .owner-logout { position: absolute; top: 14px; right: 14px; width: auto; min-height: 38px; margin: 0; padding: 0 11px; }
   .owner-metrics { grid-template-columns: 1fr 1fr; }
   .owner-configuration { grid-template-columns: 1fr; }
   .owner-admin-form { grid-template-columns: 1fr 1fr; }
